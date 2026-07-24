@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment Variables
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+
+# Chroma DB (don't commit vector database)
+storage/chroma/
+
+# Uploaded files
+uploads/
+
+# Runtime sessions
+sessions/
+sessions.json
+
+# Temporary files
+*.tmp
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Bytecode
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Keep empty folders
+!storage/.gitkeep
+!uploads/.gitkeep
+!sessions/.gitkeep
