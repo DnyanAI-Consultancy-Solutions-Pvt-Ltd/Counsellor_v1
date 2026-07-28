@@ -1,0 +1,9 @@
+UI and dynamic college-count update
+
+- Converted Category, Preferred Branches, Seat Type, Preferred Locations, College Preference, Gender and Home University to dropdown/multiselect controls.
+- Added College Count dropdown with 10, 20, 30, 40 and 50 options.
+- Added college_count to StudentProfile validation.
+- Counsellor now dynamically allocates the requested total across Dream/Target/Safe using a balanced 30/40/30 portfolio.
+- API result now exposes requested_college_count, generated_college_count and complete_requested_count.
+- UI displays requested versus generated college count and any evidence warning.
+- Reduced recommendation generation max_tokens to the configured safe limit (maximum 3000).

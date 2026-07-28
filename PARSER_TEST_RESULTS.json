@@ -1,0 +1,71 @@
+{
+  "sample_pages_tested": 9,
+  "structured_records_created": 349,
+  "invalid_percentiles_found": 0,
+  "example_records": [
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GOPENS",
+      "merit_rank": 45820,
+      "cutoff_percentile": 80.7328826,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GSCS",
+      "merit_rank": 54803,
+      "cutoff_percentile": 76.6166542,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GSTS",
+      "merit_rank": 85528,
+      "cutoff_percentile": 58.7429854,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GVJS",
+      "merit_rank": 53198,
+      "cutoff_percentile": 76.9213416,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GNT1S",
+      "merit_rank": 55202,
+      "cutoff_percentile": 76.2843676,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GNT2S",
+      "merit_rank": 47207,
+      "cutoff_percentile": 79.8081214,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GNT3S",
+      "merit_rank": 58799,
+      "cutoff_percentile": 74.1935484,
+      "page": 1
+    },
+    {
+      "college": "Government College of Engineering, Amravati",
+      "course": "Civil Engineering",
+      "seat_type": "GOBCS",
+      "merit_rank": 55212,
+      "cutoff_percentile": 76.2843676,
+      "page": 1
+    }
+  ]
+}

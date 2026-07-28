@@ -1,0 +1,18 @@
+TARGETED ROOT-CAUSE FIX — NO ARCHITECTURE CHANGE
+
+1. Recommendation generation no longer depends on the LLM returning every college row.
+2. Semantic search results are combined with all structured cutoff records already indexed in ChromaDB.
+3. Branch, category, seat type and percentile-zone checks are executed deterministically.
+4. Exact Dream/Target/Safe quotas are attempted first; unused valid choices from other zones fill the remaining requested total.
+5. The backend logs pipeline diagnostics:
+   - indexed cutoff chunks
+   - branch matches
+   - category matches
+   - eligible unique choices
+   - candidates per zone
+   - final selected count
+6. No college or cutoff is invented.
+7. Existing UI, FastAPI, ChromaDB, Groq, feedback and session architecture are unchanged.
+
+IMPORTANT:
+Re-upload and re-index the cutoff PDF if the existing Chroma collection was created by an older parser version.

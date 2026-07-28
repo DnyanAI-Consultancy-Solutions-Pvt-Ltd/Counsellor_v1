@@ -1,0 +1,20 @@
+Agentic MHT-CET Counsellor V3 Production
+
+1. Extract this ZIP using Windows Explorer or 7-Zip.
+2. Open PowerShell inside the extracted folder.
+3. Create and activate the virtual environment:
+   python -m venv venv
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   .\venv\Scripts\Activate.ps1
+4. Install dependencies:
+   python -m pip install --upgrade pip
+   pip install -r requirements.txt
+5. Copy .env.example to .env and add your GROQ_API_KEY.
+6. Start backend:
+   uvicorn api:app
+7. In a second PowerShell terminal, activate venv and run:
+   streamlit run app.py
+
+Important:
+- Delete storage\chroma before re-indexing old data with this optimized parser.
+- The ZIP contains a single top-level folder named Agentic_MHTCET_Counsellor_V3_Production.

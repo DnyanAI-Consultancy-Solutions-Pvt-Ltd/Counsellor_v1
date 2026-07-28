@@ -1,0 +1,38 @@
+# Virtual Environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ChromaDB (ignore if it can be recreated)
+storage/
+chroma_db/
+
+# Generated files
+*.xlsx
+*.csv
+
+# Streamlit cache
+.streamlit/secrets.toml
