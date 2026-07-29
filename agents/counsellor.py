@@ -9,6 +9,7 @@ from config.settings import get_settings
 from rag.retriever import Retriever
 from services.llm_service import LLMService, get_llm_service
 from services.preference_service import PreferenceService
+from tools.eligibility_tool import apply_profile_filters, seat_is_eligible
 
 
 class CounsellorAgent:
@@ -49,8 +50,12 @@ class CounsellorAgent:
             category=str(student_profile.get("category", "OPEN")),
             preferred_branches=[],  # branch filtering already performed with diagnostics
         )
-        candidates = self._build_deterministic_candidates(
+        profile_filtered, filter_report = apply_profile_filters(
             category_filtered,
+            student_profile,
+        )
+        candidates = self._build_deterministic_candidates(
+            profile_filtered,
             student_profile=student_profile,
             student_percentile=percentile,
         )
@@ -69,6 +74,8 @@ class CounsellorAgent:
             "indexed_cutoff_chunks": len(raw_results),
             "rows_matching_branch": len(branch_filtered),
             "rows_matching_category": len(category_filtered),
+            "rows_matching_all_active_filters": len(profile_filtered),
+            "active_filter_report": filter_report,
             "eligible_unique_candidates": len(candidates),
             "final_selected": len(recommendations),
             "zone_candidate_counts": dict(Counter(item["zone"] for item in candidates)),
@@ -76,8 +83,8 @@ class CounsellorAgent:
         self._log_diagnostics(student_profile, requested_total, diagnostics)
 
         strategy = (
-            "Retrieved broad CAP cutoff evidence, then applied branch, category and "
-            "configured percentile-zone rules deterministically before ranking the final list."
+            "Retrieved broad CAP cutoff evidence, then applied every active profile filter "
+            "and configured percentile-zone rule deterministically before ranking the final list."
         )
         result = {
             "status": "success" if complete else "partial_success",
@@ -87,7 +94,7 @@ class CounsellorAgent:
             "student_profile": student_profile,
             "retrieval_plan": plan,
             "recommendations": recommendations,
-            "evidence_count": len(category_filtered),
+            "evidence_count": len(profile_filtered),
             "zone_counts": zone_counts,
             "requested_zone_counts": requested,
             "missing_zone_counts": missing,
@@ -99,7 +106,7 @@ class CounsellorAgent:
         if not complete:
             result["evidence_warning"] = (
                 f"Requested {requested_total} colleges, but only {len(recommendations)} unique "
-                "college-branch choices matched the selected branch, category and configured "
+                "college-branch choices matched all active profile filters and configured "
                 "cutoff windows in the indexed CAP evidence. "
                 f"Pipeline counts: {diagnostics}. No college or cutoff was invented."
             )
@@ -143,7 +150,6 @@ class CounsellorAgent:
         student_profile: dict[str, Any],
         student_percentile: float,
     ) -> list[dict[str, Any]]:
-        selected_category = str(student_profile.get("category", "OPEN") or "OPEN").strip().upper()
         best_by_choice: dict[tuple[str, str], dict[str, Any]] = {}
 
         for evidence_id, result in enumerate(results, start=1):
@@ -155,7 +161,7 @@ class CounsellorAgent:
 
             seat_cutoffs = result.get("matching_seat_cutoffs") or {}
             for seat_type, values in seat_cutoffs.items():
-                if not self._seat_matches_category(str(seat_type), selected_category):
+                if not seat_is_eligible(str(seat_type), student_profile, result):
                     continue
                 try:
                     cutoff = float(values.get("cutoff_percentile"))
@@ -251,6 +257,8 @@ class CounsellorAgent:
         print(f"Indexed cutoff chunks    : {diagnostics.get('indexed_cutoff_chunks')}")
         print(f"Rows matching branch     : {diagnostics.get('rows_matching_branch')}")
         print(f"Rows matching category   : {diagnostics.get('rows_matching_category')}")
+        print(f"Rows matching all filters: {diagnostics.get('rows_matching_all_active_filters')}")
+        print(f"Active filter report     : {diagnostics.get('active_filter_report')}")
         print(f"Eligible unique choices  : {diagnostics.get('eligible_unique_candidates')}")
         print(f"Zone candidate counts    : {diagnostics.get('zone_candidate_counts')}")
         print(f"Final selected           : {diagnostics.get('final_selected')}")
