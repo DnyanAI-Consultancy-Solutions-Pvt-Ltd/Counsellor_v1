@@ -1,6 +1,0 @@
-Fixes included:
-1. Strict category validation: OBC results now accept only OBC seat codes and reject OPEN, SC, ST, EWS, TFWS, DEF and PWD rows.
-2. Location is derived from the institute name when the CAP evidence has no dedicated location field. A preferred location is not compulsory merely to populate the location column.
-3. Streamlit dataframe index is hidden, so the inappropriate unlabeled first column is removed.
-4. Result columns are presented in a cleaner order and evidence_ids are hidden from the UI table.
-5. The count warning now explains requested count, generated count and zone-wise shortages in plain language.
