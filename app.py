@@ -798,27 +798,27 @@ with center_column:
         if feedback_clicked:
             if not result or not result.get("session_id"):
                 st.warning("Generate recommendations before applying feedback.")
+
             elif not feedback_instruction.strip():
                 st.warning("Enter a feedback instruction first.")
+
             else:
                 feedback_body = {
                     "session_id": result["session_id"],
                     "feedback": feedback_instruction.strip(),
                 }
+
                 try:
                     with st.spinner("Feedback Agent is refining the recommendations..."):
-                        st.session_state.result = _post_json(
+                        updated_result = _post_json(
                             "/feedback",
                             feedback_body,
                             1200,
                         )
-                        st.session_state.feedback_instruction = ""
-                        st.rerun()
+
+                        st.session_state.result = updated_result
+
+                    st.rerun()
+
                 except (requests.RequestException, RuntimeError) as exc:
                     st.error(f"Feedback request failed: {exc}")
-
-        if not result:
-            st.markdown(
-                '<div class="status-ready">● Upload documents and generate recommendations to see results here.</div>',
-                unsafe_allow_html=True,
-            )

@@ -149,6 +149,7 @@ class CounsellorAgent:
         results: list[dict[str, Any]],
         student_profile: dict[str, Any],
         student_percentile: float,
+        include_outside_window: bool = False,
     ) -> list[dict[str, Any]]:
         best_by_choice: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -170,8 +171,19 @@ class CounsellorAgent:
                 if not math.isfinite(cutoff) or not 0 <= cutoff <= 100:
                     continue
                 zone = self._classify_zone(cutoff, student_percentile)
-                if zone is None:
+                if zone is None and not include_outside_window:
                     continue
+
+                decision_code = (
+                    "ELIGIBLE_WITHIN_RECOMMENDATION_WINDOW"
+                    if zone is not None
+                    else "OUTSIDE_RECOMMENDATION_WINDOW"
+                )
+                reason = (
+                    self._reason_for_zone(zone, cutoff, student_percentile)
+                    if zone is not None
+                    else self._reason_outside_window(cutoff, student_percentile)
+                )
 
                 item = {
                     "rank": 0,
@@ -184,7 +196,9 @@ class CounsellorAgent:
                     "historical_cutoff": round(cutoff, 7),
                     "student_percentile": student_percentile,
                     "cutoff_gap": round(student_percentile - cutoff, 7),
-                    "reason": self._reason_for_zone(zone, cutoff, student_percentile),
+                    "reason": reason,
+                    "decision_code": decision_code,
+                    "within_recommendation_window": zone is not None,
                     "evidence_ids": [evidence_id],
                     "source_page": metadata.get("page_number", "unknown"),
                     "source_file": metadata.get("source_file", "unknown"),
@@ -196,8 +210,347 @@ class CounsellorAgent:
 
         candidates = list(best_by_choice.values())
         zone_order = {"Dream": 0, "Target": 1, "Safe": 2}
-        candidates.sort(key=lambda item: (zone_order[item["zone"]], self._candidate_priority(item)))
+        candidates.sort(
+            key=lambda item: (
+                zone_order.get(item.get("zone"), 99),
+                self._candidate_priority(item),
+            )
+        )
         return candidates
+
+    def evaluate_requested_options(
+        self,
+        student_profile: dict[str, Any],
+        filters: dict[str, Any] | None,
+        user_request: str | None = None,
+        existing_recommendations: list[dict[str, Any]] | None = None,
+        requested_count: int = 1,
+    ) -> dict[str, Any]:
+        """Evaluate a targeted feedback request without changing portfolio generation.
+
+        This method uses the same retriever, profile filters, seat eligibility and
+        configured Dream/Target/Safe windows as :meth:`counsel`. Records outside
+        those windows are retained only for a grounded rejection explanation.
+        """
+
+        profile = dict(student_profile or {})
+        filters = dict(filters or {})
+        percentile = self._validate_profile(profile)
+
+        college = self._first_filter_value(filters.get("college"))
+        branch = self._first_filter_value(filters.get("branch"))
+        location = self._first_filter_value(filters.get("location"))
+        seat_type = self._first_filter_value(filters.get("seat_type"))
+
+        if college:
+            profile["preferred_colleges"] = [college]
+        if branch:
+            profile["preferred_branches"] = [branch]
+        if location:
+            profile["preferred_locations"] = [location]
+        if seat_type:
+            profile["seat_type"] = seat_type
+
+        filter_text = " ".join(
+            str(value)
+            for value in filters.values()
+            if value not in (None, "", [], {})
+        ).strip()
+        category = str(profile.get("category", "OPEN"))
+        queries = self._normalise_queries([
+            f"{filter_text} {category} MHT CET CAP cutoff",
+            f"{user_request or filter_text} Maharashtra engineering CAP cutoff",
+            f"{filter_text} engineering institute branch cutoff percentile",
+        ])
+        if not queries:
+            queries = self._fallback_queries(profile, user_request)
+
+        raw_results = self.retriever.retrieve_cutoff_pool(
+            queries=queries,
+            top_k_per_query=max(self.settings.results_per_query, 30),
+            final_limit=max(self.settings.retrieval_limit, requested_count * 20, 100),
+        )
+        branch_filtered = self._filter_branch_results(raw_results, profile)
+        category_filtered = self.retriever.filter_cutoff_candidates(
+            branch_filtered,
+            category=category,
+            preferred_branches=[],
+        )
+        profile_filtered, filter_report = apply_profile_filters(
+            category_filtered,
+            profile,
+        )
+
+        evaluated = self._build_deterministic_candidates(
+            profile_filtered,
+            student_profile=profile,
+            student_percentile=percentile,
+            include_outside_window=True,
+        )
+        evaluated = [
+            item for item in evaluated
+            if self.preferences.matches_filters(item, filters)
+        ]
+
+        existing_keys = {
+            self.preferences.key(item)
+            for item in (existing_recommendations or [])
+            if isinstance(item, dict)
+        }
+        qualified = [
+            item for item in evaluated
+            if item.get("zone") in self.ZONES
+            and self.preferences.key(item) not in existing_keys
+        ]
+        qualified.sort(key=self._candidate_priority)
+
+        outside = [item for item in evaluated if item.get("zone") is None]
+        outside.sort(key=self._candidate_priority)
+        closest = sorted(evaluated, key=self._candidate_priority)[:5]
+
+        if qualified:
+            decision = "approved"
+            decision_code = "APPROVED_GROUNDED_OPTION"
+        elif not profile_filtered:
+            decision = "rejected"
+            decision_code = "REQUESTED_COMBINATION_NOT_FOUND"
+        elif not evaluated:
+            decision = "rejected"
+            decision_code = "NO_ELIGIBLE_SEAT"
+        elif outside:
+            decision = "rejected"
+            decision_code = "OUTSIDE_RECOMMENDATION_WINDOW"
+        else:
+            decision = "rejected"
+            decision_code = "ALREADY_PRESENT_OR_FILTER_MISMATCH"
+
+        explanation = self._targeted_decision_explanation(
+            decision=decision,
+            decision_code=decision_code,
+            filters=filters,
+            percentile=percentile,
+            qualified=qualified,
+            closest=closest,
+            matching_rows=len(profile_filtered),
+        )
+
+        return {
+            "decision": decision,
+            "decision_code": decision_code,
+            "explanation": explanation,
+            "qualified_candidates": qualified[: max(1, int(requested_count))],
+            "matching_evidence_count": len(profile_filtered),
+            "eligible_evidence_count": len(evaluated),
+            "closest_evidence": closest,
+            "outside_window_evidence": outside[:5],
+            "filter_report": filter_report,
+            "temporary_profile_filters": {
+                key: profile.get(key)
+                for key in (
+                    "preferred_colleges",
+                    "preferred_branches",
+                    "preferred_locations",
+                    "seat_type",
+                )
+                if profile.get(key) not in (None, "", [], {})
+            },
+        }
+
+    def collect_feedback_evidence(
+        self,
+        student_profile: dict[str, Any],
+        filters: dict[str, Any] | None,
+        user_request: str | None = None,
+        existing_recommendations: list[dict[str, Any]] | None = None,
+        evidence_limit: int = 30,
+    ) -> dict[str, Any]:
+        """Return neutral, grounded evidence for feedback-agent reasoning.
+
+        This method deliberately does not approve, reject, add, remove, classify risk,
+        or mutate the recommendation list. It only retrieves indexed CAP records,
+        applies profile/seat eligibility, calculates cutoff facts, and returns candidate
+        IDs that a reasoning agent may select.
+        """
+
+        profile = dict(student_profile or {})
+        request_filters = dict(filters or {})
+        percentile = self._validate_profile(profile)
+
+        college = self._first_filter_value(request_filters.get("college"))
+        branch = self._first_filter_value(request_filters.get("branch"))
+        location = self._first_filter_value(request_filters.get("location"))
+        seat_type = self._first_filter_value(request_filters.get("seat_type"))
+
+        if college:
+            profile["preferred_colleges"] = [college]
+        if branch:
+            profile["preferred_branches"] = [branch]
+        if location:
+            profile["preferred_locations"] = [location]
+        if seat_type:
+            profile["seat_type"] = seat_type
+
+        filter_text = " ".join(
+            str(value)
+            for value in request_filters.values()
+            if value not in (None, "", [], {})
+        ).strip()
+        category = str(profile.get("category", "OPEN"))
+        queries = self._normalise_queries([
+            f"{filter_text} {category} MHT CET CAP cutoff",
+            f"{user_request or filter_text} Maharashtra engineering CAP cutoff",
+            f"{filter_text} engineering institute branch seat cutoff percentile",
+        ])
+        if not queries:
+            queries = self._fallback_queries(profile, user_request)
+
+        raw_results = self.retriever.retrieve_cutoff_pool(
+            queries=queries,
+            top_k_per_query=max(self.settings.results_per_query, 40),
+            final_limit=max(self.settings.retrieval_limit, evidence_limit * 10, 150),
+        )
+        branch_filtered = self._filter_branch_results(raw_results, profile)
+        category_filtered = self.retriever.filter_cutoff_candidates(
+            branch_filtered,
+            category=category,
+            preferred_branches=[],
+        )
+        profile_filtered, filter_report = apply_profile_filters(
+            category_filtered,
+            profile,
+        )
+
+        candidates = self._build_deterministic_candidates(
+            profile_filtered,
+            student_profile=profile,
+            student_percentile=percentile,
+            include_outside_window=True,
+        )
+        candidates = [
+            item for item in candidates
+            if self.preferences.matches_filters(item, request_filters)
+        ]
+
+        existing_keys = {
+            self.preferences.key(item)
+            for item in (existing_recommendations or [])
+            if isinstance(item, dict)
+        }
+
+        neutral_candidates: list[dict[str, Any]] = []
+        for index, item in enumerate(candidates[: max(1, int(evidence_limit))], start=1):
+            record = dict(item)
+            record["candidate_id"] = f"candidate-{index}"
+            record["already_present"] = self.preferences.key(record) in existing_keys
+            cutoff = float(record.get("historical_cutoff", 0.0))
+            difference = cutoff - percentile
+            record["cutoff_difference"] = round(difference, 7)
+            record["cutoff_relation"] = (
+                "above_student" if difference > 0
+                else "below_student" if difference < 0
+                else "equal_to_student"
+            )
+            # The configured window is factual context, not an approval decision.
+            record["configured_zone"] = record.get("zone")
+            record["within_configured_window"] = bool(
+                record.get("within_recommendation_window")
+            )
+            neutral_candidates.append(record)
+
+        return {
+            "student_percentile": percentile,
+            "request_filters": request_filters,
+            "search_queries": queries,
+            "matching_profile_rows": len(profile_filtered),
+            "eligible_candidate_count": len(candidates),
+            "candidates": neutral_candidates,
+            "filter_report": filter_report,
+            "evidence_policy": {
+                "source_required": True,
+                "eligible_seat_required": True,
+                "outside_window_is_not_automatic_rejection": True,
+                "agent_must_explain_risk": True,
+            },
+        }
+
+    @staticmethod
+    def _first_filter_value(value: Any) -> str | None:
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    return text
+            return None
+        text = str(value or "").strip()
+        return text or None
+
+    @staticmethod
+    def _reason_outside_window(cutoff: float, student_percentile: float) -> str:
+        difference = cutoff - student_percentile
+        relation = "above" if difference >= 0 else "below"
+        return (
+            f"Historical cutoff is {abs(difference):.2f} percentile points "
+            f"{relation} the student percentile and falls outside the configured "
+            "Dream, Target and Safe recommendation windows."
+        )
+
+    @staticmethod
+    def _targeted_decision_explanation(
+        *,
+        decision: str,
+        decision_code: str,
+        filters: dict[str, Any],
+        percentile: float,
+        qualified: list[dict[str, Any]],
+        closest: list[dict[str, Any]],
+        matching_rows: int,
+    ) -> str:
+        requested_text = ", ".join(
+            f"{key.replace('_', ' ')} '{value}'"
+            for key, value in filters.items()
+            if value not in (None, "", [], {})
+        ) or "the requested option"
+
+        if decision == "approved" and qualified:
+            best = qualified[0]
+            return (
+                f"The request for {requested_text} is supported by indexed CAP evidence. "
+                f"The closest approved option is {best.get('college')} - "
+                f"{best.get('branch')} with historical cutoff "
+                f"{float(best.get('historical_cutoff', 0.0)):.2f}, compared with "
+                f"the student's {percentile:.2f} percentile. It falls in the "
+                f"{best.get('zone')} zone, so it can be added."
+            )
+        if decision_code == "REQUESTED_COMBINATION_NOT_FOUND":
+            return (
+                f"I did not add {requested_text}. No matching college/branch record "
+                "was found after applying the request to the currently indexed CAP "
+                "evidence. No college or cutoff was invented."
+            )
+        if decision_code == "NO_ELIGIBLE_SEAT":
+            return (
+                f"I found {matching_rows} matching CAP record(s) for {requested_text}, "
+                "but none contained a seat allocation eligible for the student's "
+                "category, gender and home-university profile. Therefore it was not added."
+            )
+        if decision_code == "OUTSIDE_RECOMMENDATION_WINDOW" and closest:
+            best = closest[0]
+            cutoff = float(best.get("historical_cutoff", 0.0))
+            gap = cutoff - percentile
+            relation = "above" if gap >= 0 else "below"
+            return (
+                f"I evaluated {requested_text} using indexed CAP evidence, but did not "
+                f"add it. The closest eligible record is {best.get('college')} - "
+                f"{best.get('branch')} ({best.get('category_or_seat_type')}) with "
+                f"historical cutoff {cutoff:.2f}. This is {abs(gap):.2f} percentile "
+                f"points {relation} the student's {percentile:.2f} percentile and falls "
+                "outside the configured Dream, Target and Safe windows."
+            )
+        return (
+            f"I did not add {requested_text}. Matching evidence was reviewed, but no "
+            "new unique option satisfied every requested filter and the configured "
+            "counselling criteria. The existing list was left unchanged."
+        )
 
     @staticmethod
     def _candidate_priority(item: dict[str, Any]) -> tuple[float, float]:
