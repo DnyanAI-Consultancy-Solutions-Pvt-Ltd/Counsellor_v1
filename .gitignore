@@ -36,3 +36,10 @@ chroma_db/
 
 # Streamlit cache
 .streamlit/secrets.toml
+
+venv/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
