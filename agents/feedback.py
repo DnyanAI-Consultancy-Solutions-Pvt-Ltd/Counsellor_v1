@@ -473,35 +473,37 @@ class FeedbackAgent:
         feedback: str,
         pending: dict[str, Any],
     ) -> dict[str, Any]:
-        interpretation = self.llm.generate_json(
-            system_prompt="""
-You are resolving a pending MHT-CET counselling decision. Interpret the student's
-latest reply only against the supplied pending requested option and alternatives.
-Never invent an option.
+        interpretation = self._parse_ui_action(feedback, pending)
+        if interpretation is None:
+            interpretation = self.llm.generate_json(
+                system_prompt="""
+    You are resolving a pending MHT-CET counselling decision. Interpret the student's
+    latest reply only against the supplied pending requested option and alternatives.
+    Never invent an option.
 
-Return exactly:
-{
-  "action": "confirm_requested" | "choose_same_college" | "choose_same_branch" | "show_more_same_college" | "show_more_same_branch" | "cancel" | "new_request" | "unclear",
-  "selected_candidate_ids": ["candidate-id"],
-  "answer": "brief response"
-}
+    Return exactly:
+    {
+      "action": "confirm_requested" | "choose_same_college" | "choose_same_branch" | "show_more_same_college" | "show_more_same_branch" | "cancel" | "new_request" | "unclear",
+      "selected_candidate_ids": ["candidate-id"],
+      "answer": "brief response"
+    }
 
-Examples of meaning, not hardcoded wording:
-- agreement to add the original risky option -> confirm_requested
-- choosing another branch in the same institute -> choose_same_college
-- choosing a better college for the same branch -> choose_same_branch
-- asking to see more branches/colleges -> corresponding show_more action
-- declining -> cancel
-- an unrelated new modification -> new_request
-- ambiguous reply -> unclear
-""",
-            user_prompt=(
-                f"PENDING DECISION:\n{json.dumps(pending, default=str)}\n\n"
-                f"STUDENT REPLY:\n{feedback}"
-            ),
-            temperature=0.0,
-            max_tokens=1200,
-        )
+    Examples of meaning, not hardcoded wording:
+    - agreement to add the original risky option -> confirm_requested
+    - choosing another branch in the same institute -> choose_same_college
+    - choosing a better college for the same branch -> choose_same_branch
+    - asking to see more branches/colleges -> corresponding show_more action
+    - declining -> cancel
+    - an unrelated new modification -> new_request
+    - ambiguous reply -> unclear
+    """,
+                user_prompt=(
+                    f"PENDING DECISION:\n{json.dumps(pending, default=str)}\n\n"
+                    f"STUDENT REPLY:\n{feedback}"
+                ),
+                temperature=0.0,
+                max_tokens=1200,
+            )
         action = str(interpretation.get("action") or "unclear").strip().casefold()
         selected_ids = interpretation.get("selected_candidate_ids", [])
         if not isinstance(selected_ids, list):
@@ -660,6 +662,138 @@ Examples of meaning, not hardcoded wording:
             pending_action=pending,
         )
 
+    @staticmethod
+    def _parse_ui_action(
+        feedback: str,
+        pending: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resolve trusted UI button commands without another LLM call."""
+        text = str(feedback or "").strip()
+        prefix = "UI_ACTION::"
+        if not text.startswith(prefix):
+            return None
+
+        parts = text.split("::", 2)
+        command = parts[1].strip().upper() if len(parts) > 1 else ""
+        candidate_id = parts[2].strip() if len(parts) > 2 else ""
+
+        mapping = {
+            "CONFIRM_REQUESTED": "confirm_requested",
+            "CANCEL": "cancel",
+            "SHOW_MORE_SAME_COLLEGE": "show_more_same_college",
+            "SHOW_MORE_SAME_BRANCH": "show_more_same_branch",
+            "CHOOSE_SAME_COLLEGE": "choose_same_college",
+            "CHOOSE_SAME_BRANCH": "choose_same_branch",
+        }
+        action = mapping.get(command)
+        if not action:
+            return {
+                "action": "unclear",
+                "selected_candidate_ids": [],
+                "answer": "I could not understand that action. Please choose one of the available options.",
+            }
+
+        selected = [candidate_id] if candidate_id else []
+        return {
+            "action": action,
+            "selected_candidate_ids": selected,
+            "answer": "",
+        }
+
+    @staticmethod
+    def _candidate_ui_payload(item: dict[str, Any]) -> dict[str, Any]:
+        """Return only fields needed by the client-side counselling card."""
+        try:
+            cutoff = round(float(item.get("historical_cutoff")), 2)
+        except (TypeError, ValueError):
+            cutoff = None
+        try:
+            student = round(float(item.get("student_percentile")), 2)
+        except (TypeError, ValueError):
+            student = None
+        gap = round(cutoff - student, 2) if cutoff is not None and student is not None else None
+        return {
+            "candidate_id": str(item.get("candidate_id") or ""),
+            "college": str(item.get("college") or "").strip(),
+            "branch": str(item.get("branch") or "").strip(),
+            "seat_type": str(item.get("seat_type") or "").strip(),
+            "historical_cutoff": cutoff,
+            "student_percentile": student,
+            "gap": gap,
+            "risk_level": str(item.get("risk_level") or "").strip(),
+            "zone": str(item.get("zone") or "").strip(),
+            "location": str(item.get("location") or "").strip(),
+        }
+
+    def _build_feedback_ui(
+        self,
+        pending_action: dict[str, Any] | None,
+        responses: list[str],
+    ) -> dict[str, Any] | None:
+        if not isinstance(pending_action, dict):
+            return None
+
+        requested = [
+            self._candidate_ui_payload(item)
+            for item in pending_action.get("requested_candidates", [])
+            if isinstance(item, dict)
+        ]
+        same_college = [
+            self._candidate_ui_payload(item)
+            for item in pending_action.get("same_college_alternatives", [])
+            if isinstance(item, dict)
+        ]
+        same_branch = [
+            self._candidate_ui_payload(item)
+            for item in pending_action.get("same_branch_alternatives", [])
+            if isinstance(item, dict)
+        ]
+
+        message = str(pending_action.get("counsellor_response") or "").strip()
+        if not message and responses:
+            message = str(responses[0]).strip()
+
+        actions: list[dict[str, str]] = []
+        if requested:
+            actions.append({
+                "id": "confirm_requested",
+                "label": "➕ Add Anyway",
+                "feedback": "UI_ACTION::CONFIRM_REQUESTED",
+                "kind": "primary",
+            })
+        if same_college:
+            actions.append({
+                "id": "show_same_college",
+                "label": "🎓 Better Branches",
+                "feedback": "UI_ACTION::SHOW_MORE_SAME_COLLEGE",
+                "kind": "secondary",
+            })
+        if same_branch:
+            actions.append({
+                "id": "show_same_branch",
+                "label": "🏫 Better Colleges",
+                "feedback": "UI_ACTION::SHOW_MORE_SAME_BRANCH",
+                "kind": "secondary",
+            })
+        actions.append({
+            "id": "cancel",
+            "label": "✖ Leave Unchanged",
+            "feedback": "UI_ACTION::CANCEL",
+            "kind": "secondary",
+        })
+
+        return {
+            "type": "pending_choice",
+            "title": "Admission Analysis",
+            "message": message,
+            "confirmation_reason": str(pending_action.get("confirmation_reason") or "").strip(),
+            "portfolio_guidance": str(pending_action.get("portfolio_guidance") or "").strip(),
+            "requested_options": requested,
+            "same_college_alternatives": same_college,
+            "same_branch_alternatives": same_branch,
+            "actions": actions,
+        }
+
     def _build_result(
         self,
         previous_result: dict[str, Any],
@@ -695,6 +829,7 @@ Examples of meaning, not hardcoded wording:
         )
         updated["generated_college_count"] = len(final_recommendations)
         updated["pending_feedback_action"] = pending_action
+        updated["feedback_ui"] = self._build_feedback_ui(pending_action, responses)
         updated["awaiting_user_confirmation"] = bool(pending_action)
         updated["status"] = (
             "awaiting_confirmation"

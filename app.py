@@ -183,7 +183,14 @@ def _prepare_table(recommendations: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def _assistant_response_text(result: dict[str, Any]) -> str:
-    """Extract the counsellor's conversational reply from the API result."""
+    """Extract a concise reply; structured pending details are rendered separately."""
+    feedback_ui = result.get("feedback_ui")
+    if isinstance(feedback_ui, dict) and feedback_ui.get("type") == "pending_choice":
+        message = str(feedback_ui.get("message") or "").strip()
+        if message:
+            return message
+        return "I found the requested option and prepared safer alternatives. Choose an action below."
+
     responses = result.get("counsellor_responses")
     if isinstance(responses, list):
         combined = "\n\n".join(
@@ -204,6 +211,160 @@ def _append_chat_message(role: str, content: str) -> None:
     text = str(content or "").strip()
     if text:
         st.session_state.chat_history.append({"role": role, "content": text})
+
+
+def _format_number(value: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _candidate_title(candidate: dict[str, Any]) -> str:
+    college = str(candidate.get("college") or "College").strip()
+    branch = str(candidate.get("branch") or "Branch").strip()
+    return f"{college} — {branch}"
+
+
+def _send_feedback_action(
+    session_id: str,
+    feedback: str,
+    visible_message: str,
+) -> None:
+    """Send a typed or button-generated instruction through the same feedback API."""
+    _append_chat_message("user", visible_message)
+    try:
+        with st.spinner("Feedback Agent is analysing your choice..."):
+            updated_result = _post_json(
+                "/feedback",
+                {"session_id": session_id, "feedback": feedback},
+                1200,
+            )
+        st.session_state.result = updated_result
+        _append_chat_message("assistant", _assistant_response_text(updated_result))
+    except (requests.RequestException, RuntimeError) as exc:
+        _append_chat_message("assistant", f"I could not process that request: {exc}")
+    st.session_state.chat_input_version += 1
+    st.rerun()
+
+
+def _render_candidate_card(candidate: dict[str, Any], accent: str = "") -> None:
+    gap = candidate.get("gap")
+    try:
+        gap_text = f"{float(gap):+.2f}"
+    except (TypeError, ValueError):
+        gap_text = "—"
+    risk = str(candidate.get("risk_level") or "Not stated")
+    st.markdown(
+        f"""
+<div class="choice-card {accent}">
+  <div class="choice-title">{_candidate_title(candidate)}</div>
+  <div class="choice-metrics">
+    <span><b>Cutoff:</b> {_format_number(candidate.get('historical_cutoff'))}</span>
+    <span><b>Your percentile:</b> {_format_number(candidate.get('student_percentile'))}</span>
+    <span><b>Gap:</b> {gap_text}</span>
+    <span><b>Risk:</b> {risk}</span>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_feedback_actions(result: dict[str, Any], session_id: str | None) -> None:
+    """Render a compact pending-decision panel with collapsed alternatives."""
+    if not session_id:
+        return
+
+    ui = result.get("feedback_ui")
+    pending = result.get("pending_feedback_action")
+    if not isinstance(ui, dict) or ui.get("type") != "pending_choice" or not pending:
+        return
+
+    requested = [
+        item for item in ui.get("requested_options", [])
+        if isinstance(item, dict)
+    ]
+    same_college = [
+        item for item in ui.get("same_college_alternatives", [])
+        if isinstance(item, dict)
+    ]
+    same_branch = [
+        item for item in ui.get("same_branch_alternatives", [])
+        if isinstance(item, dict)
+    ]
+
+    # Compact admission-analysis card.
+    st.markdown("#### ⚠️ Admission Analysis")
+    for candidate in requested[:1]:
+        _render_candidate_card(candidate, "requested-card")
+
+    reason = str(ui.get("confirmation_reason") or "").strip()
+    if reason:
+        st.caption(reason)
+
+    # Alternatives remain collapsed until the student chooses to inspect them.
+    if same_college:
+        with st.expander(
+            f"🎓 Better Branches ({len(same_college)})",
+            expanded=False,
+        ):
+            for index, candidate in enumerate(same_college[:8]):
+                row_left, row_right = st.columns([7.5, 1.25], vertical_alignment="center")
+                with row_left:
+                    _render_candidate_card(candidate, "compact-alternative-card")
+                with row_right:
+                    if st.button(
+                        "➕ Add",
+                        key=f"choose_same_college_{candidate.get('candidate_id')}_{index}",
+                        use_container_width=True,
+                    ):
+                        _send_feedback_action(
+                            session_id,
+                            f"UI_ACTION::CHOOSE_SAME_COLLEGE::{candidate.get('candidate_id')}",
+                            f"Add {_candidate_title(candidate)}",
+                        )
+
+    if same_branch:
+        with st.expander(
+            f"🏫 Better Colleges ({len(same_branch)})",
+            expanded=False,
+        ):
+            for index, candidate in enumerate(same_branch[:8]):
+                row_left, row_right = st.columns([7.5, 1.25], vertical_alignment="center")
+                with row_left:
+                    _render_candidate_card(candidate, "compact-alternative-card")
+                with row_right:
+                    if st.button(
+                        "➕ Add",
+                        key=f"choose_same_branch_{candidate.get('candidate_id')}_{index}",
+                        use_container_width=True,
+                    ):
+                        _send_feedback_action(
+                            session_id,
+                            f"UI_ACTION::CHOOSE_SAME_BRANCH::{candidate.get('candidate_id')}",
+                            f"Add {_candidate_title(candidate)}",
+                        )
+
+    # Compact single-row action toolbar.
+    actions = [item for item in ui.get("actions", []) if isinstance(item, dict)]
+    if actions:
+        st.markdown('<div class="compact-action-title">Choose an action</div>', unsafe_allow_html=True)
+        action_columns = st.columns(len(actions), gap="small", vertical_alignment="center")
+        for index, action in enumerate(actions):
+            with action_columns[index]:
+                button_type = "primary" if action.get("kind") == "primary" else "secondary"
+                if st.button(
+                    str(action.get("label") or "Continue"),
+                    key=f"pending_action_{action.get('id')}_{index}",
+                    type=button_type,
+                    use_container_width=True,
+                ):
+                    _send_feedback_action(
+                        session_id,
+                        str(action.get("feedback") or ""),
+                        str(action.get("label") or "Continue"),
+                    )
 
 
 
@@ -285,7 +446,7 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
 [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
     display: flex !important;
     flex-direction: column !important;
-    min-height: calc(100vh - 1rem) !important;
+    min-height: auto !important;
 }
 
 [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] > div {
@@ -471,6 +632,105 @@ label[data-testid="stWidgetLabel"] p { color: #344054; font-size: 0.73rem; font-
     color: var(--muted);
     font-size: 0.72rem;
     margin: 0.2rem 0 0.4rem;
+}
+
+
+.decision-panel {
+    border: 1px solid #dfe6f1;
+    border-radius: 12px;
+    background: #fbfcff;
+    padding: 0.8rem;
+    margin: 0.55rem 0 0.75rem;
+}
+
+.choice-card {
+    border: 1px solid #e1e7f0;
+    border-radius: 10px;
+    background: #ffffff;
+    padding: 0.7rem 0.8rem;
+    margin: 0.3rem 0;
+}
+
+.requested-card {
+    border-left: 4px solid #e5484d;
+    background: #fffafa;
+}
+
+.alternative-card {
+    border-left: 4px solid #2f80ed;
+}
+
+.choice-title {
+    color: var(--navy);
+    font-weight: 800;
+    font-size: 0.88rem;
+    margin-bottom: 0.38rem;
+}
+
+.choice-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.9rem;
+    color: #475467;
+    font-size: 0.76rem;
+}
+
+
+/* Compact feedback decision controls */
+[data-testid="stExpander"] {
+    border: 1px solid #e1e7f0 !important;
+    border-radius: 9px !important;
+    background: #ffffff !important;
+    margin: 0.35rem 0 !important;
+}
+
+[data-testid="stExpander"] summary {
+    min-height: 2.35rem !important;
+    padding: 0.25rem 0.7rem !important;
+    font-weight: 750 !important;
+    color: var(--navy) !important;
+}
+
+[data-testid="stExpanderDetails"] {
+    padding: 0.15rem 0.55rem 0.45rem !important;
+}
+
+.compact-alternative-card {
+    padding: 0.48rem 0.62rem !important;
+    margin: 0.18rem 0 !important;
+}
+
+.compact-alternative-card .choice-title {
+    font-size: 0.8rem !important;
+    margin-bottom: 0.2rem !important;
+}
+
+.compact-alternative-card .choice-metrics {
+    font-size: 0.69rem !important;
+    gap: 0.18rem 0.65rem !important;
+}
+
+.compact-action-title {
+    color: var(--navy);
+    font-weight: 800;
+    font-size: 0.9rem;
+    margin: 0.55rem 0 0.25rem;
+}
+
+/* Keep nested feedback rows and button toolbars content-height only. */
+[data-testid="stExpander"] [data-testid="stColumn"],
+[data-testid="stExpander"] [data-testid="stHorizontalBlock"],
+[data-testid="stVerticalBlock"] [data-testid="stHorizontalBlock"] [data-testid="stColumn"] {
+    min-height: 0 !important;
+    height: auto !important;
+}
+
+[data-testid="stExpander"] .stButton > button,
+.compact-action-title + div .stButton > button {
+    min-height: 2.05rem !important;
+    padding: 0.25rem 0.55rem !important;
+    white-space: nowrap !important;
+    font-size: 0.78rem !important;
 }
 
 @media (max-width: 1150px) {
@@ -868,6 +1128,9 @@ with center_column:
 
         session_id = result.get("session_id") if isinstance(result, dict) else None
 
+        if isinstance(result, dict):
+            _render_feedback_actions(result, session_id)
+
         chat_prompt = st.chat_input(
             "Ask your counsellor or confirm a pending choice...",
             disabled=not bool(session_id),
@@ -875,36 +1138,11 @@ with center_column:
         )
 
         if chat_prompt:
-            _append_chat_message("user", chat_prompt)
-
-            feedback_body = {
-                "session_id": session_id,
-                "feedback": chat_prompt.strip(),
-            }
-
-            try:
-                with st.spinner("Feedback Agent is analysing your request..."):
-                    updated_result = _post_json(
-                        "/feedback",
-                        feedback_body,
-                        1200,
-                    )
-
-                st.session_state.result = updated_result
-                _append_chat_message(
-                    "assistant",
-                    _assistant_response_text(updated_result),
-                )
-                st.session_state.chat_input_version += 1
-                st.rerun()
-
-            except (requests.RequestException, RuntimeError) as exc:
-                _append_chat_message(
-                    "assistant",
-                    f"I could not process that request: {exc}",
-                )
-                st.session_state.chat_input_version += 1
-                st.rerun()
+            _send_feedback_action(
+                session_id,
+                chat_prompt.strip(),
+                chat_prompt.strip(),
+            )
 
         if st.session_state.chat_history:
             clear_left, clear_right = st.columns([1, 5])
