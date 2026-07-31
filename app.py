@@ -182,6 +182,31 @@ def _prepare_table(recommendations: list[dict[str, Any]]) -> pd.DataFrame:
     return frame
 
 
+def _assistant_response_text(result: dict[str, Any]) -> str:
+    """Extract the counsellor's conversational reply from the API result."""
+    responses = result.get("counsellor_responses")
+    if isinstance(responses, list):
+        combined = "\n\n".join(
+            str(item).strip() for item in responses if str(item).strip()
+        )
+        if combined:
+            return combined
+
+    for key in ("counsellor_response", "response", "message", "summary"):
+        value = str(result.get(key) or "").strip()
+        if value:
+            return value
+
+    return "I reviewed your request and updated the counselling result."
+
+
+def _append_chat_message(role: str, content: str) -> None:
+    text = str(content or "").strip()
+    if text:
+        st.session_state.chat_history.append({"role": role, "content": text})
+
+
+
 # ==========================================================
 # Page and state
 # ==========================================================
@@ -198,7 +223,8 @@ DEFAULT_STATE: dict[str, Any] = {
     "show_knowledge_panel": True,
     "result": None,
     "upload_result": None,
-    "feedback_instruction": "",
+    "chat_history": [],
+    "chat_input_version": 0,
 }
 for state_key, state_value in DEFAULT_STATE.items():
     if state_key not in st.session_state:
@@ -412,6 +438,40 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
 label[data-testid="stWidgetLabel"] p { color: #344054; font-size: 0.73rem; font-weight: 650; }
 [data-baseweb="select"] > div, [data-testid="stNumberInput"] input, textarea { border-radius: 7px !important; }
 [data-testid="stDataFrame"] { border: 1px solid #e8ecf3; border-radius: 7px; overflow: hidden; }
+
+
+.chat-panel {
+    border: 1px solid #e1e7f0;
+    border-radius: 12px;
+    background: #f8faff;
+    padding: 0.72rem 0.78rem 0.35rem;
+    margin-top: 0.72rem;
+}
+
+.chat-heading {
+    color: var(--navy);
+    font-size: 1rem;
+    font-weight: 850;
+    margin-bottom: 0.45rem;
+}
+
+[data-testid="stChatMessage"] {
+    border: 1px solid #e4e9f2;
+    border-radius: 12px;
+    background: #ffffff;
+    padding: 0.32rem 0.48rem;
+    margin-bottom: 0.5rem;
+}
+
+[data-testid="stChatInput"] {
+    margin-top: 0.45rem;
+}
+
+.quick-action-note {
+    color: var(--muted);
+    font-size: 0.72rem;
+    margin: 0.2rem 0 0.4rem;
+}
 
 @media (max-width: 1150px) {
     [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
@@ -681,6 +741,12 @@ if generate_clicked:
     try:
         with center_column, st.spinner("Counsellor Agent is analysing retrieved evidence..."):
             st.session_state.result = _post_json("/counsel", counselling_body, 1200)
+            st.session_state.chat_history = []
+            _append_chat_message(
+                "assistant",
+                "Your recommendation list is ready. You can ask me to add or remove a college, "
+                "explain admission risk, compare branches, or suggest better alternatives.",
+            )
             st.rerun()
     except (requests.RequestException, RuntimeError) as exc:
         with center_column:
@@ -781,44 +847,69 @@ with center_column:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("**💬 Feedback / Refinement**")
-        feedback_instruction = st.text_area(
-            "Feedback instruction",
-            placeholder="Enter your feedback (e.g., Add VJTI, remove Pune colleges, sort by cutoff...)",
-            height=78,
-            label_visibility="collapsed",
-            key="feedback_instruction",
-        )
-        feedback_clicked = st.button(
-            "Apply Feedback",
-            type="primary",
-            key="apply_feedback",
+        st.markdown(
+            '<div class="chat-panel"><div class="chat-heading">💬 AI Counsellor Chat</div>'
+            '<div class="quick-action-note">Ask naturally: “Add VJTI IT”, “Show better branches”, '
+            '“Suggest safer CS colleges”, “Remove college 5”, or “Yes, add it anyway”.</div></div>',
+            unsafe_allow_html=True,
         )
 
-        if feedback_clicked:
-            if not result or not result.get("session_id"):
-                st.warning("Generate recommendations before applying feedback.")
+        if not st.session_state.chat_history:
+            with st.chat_message("assistant", avatar="🎓"):
+                st.markdown(
+                    "Generate recommendations first. After that, I can explain cutoffs, "
+                    "suggest alternatives, and update your preference list through conversation."
+                )
+        else:
+            for message in st.session_state.chat_history:
+                avatar = "🎓" if message.get("role") == "assistant" else "👤"
+                with st.chat_message(message.get("role", "assistant"), avatar=avatar):
+                    st.markdown(str(message.get("content", "")))
 
-            elif not feedback_instruction.strip():
-                st.warning("Enter a feedback instruction first.")
+        session_id = result.get("session_id") if isinstance(result, dict) else None
 
-            else:
-                feedback_body = {
-                    "session_id": result["session_id"],
-                    "feedback": feedback_instruction.strip(),
-                }
+        chat_prompt = st.chat_input(
+            "Ask your counsellor or confirm a pending choice...",
+            disabled=not bool(session_id),
+            key=f"feedback_chat_{st.session_state.chat_input_version}",
+        )
 
-                try:
-                    with st.spinner("Feedback Agent is refining the recommendations..."):
-                        updated_result = _post_json(
-                            "/feedback",
-                            feedback_body,
-                            1200,
-                        )
+        if chat_prompt:
+            _append_chat_message("user", chat_prompt)
 
-                        st.session_state.result = updated_result
+            feedback_body = {
+                "session_id": session_id,
+                "feedback": chat_prompt.strip(),
+            }
 
+            try:
+                with st.spinner("Feedback Agent is analysing your request..."):
+                    updated_result = _post_json(
+                        "/feedback",
+                        feedback_body,
+                        1200,
+                    )
+
+                st.session_state.result = updated_result
+                _append_chat_message(
+                    "assistant",
+                    _assistant_response_text(updated_result),
+                )
+                st.session_state.chat_input_version += 1
+                st.rerun()
+
+            except (requests.RequestException, RuntimeError) as exc:
+                _append_chat_message(
+                    "assistant",
+                    f"I could not process that request: {exc}",
+                )
+                st.session_state.chat_input_version += 1
+                st.rerun()
+
+        if st.session_state.chat_history:
+            clear_left, clear_right = st.columns([1, 5])
+            with clear_left:
+                if st.button("Clear Chat", key="clear_counsellor_chat"):
+                    st.session_state.chat_history = []
+                    st.session_state.chat_input_version += 1
                     st.rerun()
-
-                except (requests.RequestException, RuntimeError) as exc:
-                    st.error(f"Feedback request failed: {exc}")

@@ -37,12 +37,26 @@ class FeedbackAgent:
         current = self.preferences.normalise(
             previous_result.get("recommendations", [])
         )
+
+        pending = previous_result.get("pending_feedback_action")
+        if isinstance(pending, dict) and pending.get("status") in {
+            "awaiting_confirmation",
+            "awaiting_choice",
+        }:
+            return self._handle_pending_response(
+                previous_result=previous_result,
+                current=current,
+                feedback=feedback,
+                pending=pending,
+            )
+
         plan = self._create_agent_plan(previous_result, current, feedback)
 
         notes: list[str] = []
         responses: list[str] = []
         audit: list[dict[str, Any]] = []
         changed = False
+        pending_action: dict[str, Any] | None = None
 
         operations = plan.get("operations", [])
         if not isinstance(operations, list):
@@ -68,6 +82,7 @@ class FeedbackAgent:
                 notes.extend(result["notes"])
                 responses.append(result["response"])
                 audit.append(result["audit"])
+                pending_action = result.get("pending_action")
 
             elif action == "remove":
                 result = self._execute_removal(current, raw_operation)
@@ -109,6 +124,11 @@ class FeedbackAgent:
                 notes.extend(result["notes"])
                 audit.append(result["audit"])
 
+            # A pending counselling decision must be resolved before any later
+            # mutation is attempted. This keeps the workflow transactional.
+            if pending_action:
+                break
+
         if not operations:
             responses.append(
                 "I reviewed the feedback, but could not identify a supported counselling "
@@ -116,31 +136,17 @@ class FeedbackAgent:
             )
             notes.append("No supported action was identified by the feedback agent.")
 
-        final_recommendations = self._classify_and_sort_recommendations(current)
-        final_recommendations = self.preferences.resequence(final_recommendations)
-        requested_counts = previous_result.get("requested_zone_counts")
-        validation = self.preferences.validate(
-            final_recommendations,
-            requested_counts if isinstance(requested_counts, dict) else None,
+        return self._build_result(
+            previous_result=previous_result,
+            current=current,
+            feedback=feedback,
+            plan=plan,
+            notes=notes,
+            responses=responses,
+            audit=audit,
+            changed=changed,
+            pending_action=pending_action,
         )
-
-        updated = dict(previous_result)
-        updated["recommendations"] = final_recommendations
-        updated["feedback"] = feedback
-        updated["feedback_plan"] = plan
-        updated["feedback_notes"] = notes
-        updated["counsellor_responses"] = responses
-        updated["feedback_audit"] = audit
-        updated["list_changed"] = changed
-        updated["validation"] = validation
-        updated["zone_counts"] = validation.get(
-            "zone_counts",
-            dict(Counter(str(item.get("zone")) for item in final_recommendations)),
-        )
-        updated["generated_college_count"] = len(final_recommendations)
-        updated["status"] = "success" if validation.get("is_valid", True) else "partial_success"
-        updated["summary"] = " ".join(responses).strip() or "Preference list reviewed."
-        return updated
 
     def _execute_agentic_addition(
         self,
@@ -157,7 +163,14 @@ class FeedbackAgent:
             filters=filters,
             user_request=feedback,
             existing_recommendations=current,
-            evidence_limit=max(20, requested_count * 10),
+            evidence_limit=max(30, requested_count * 12),
+        )
+        alternatives = self._collect_alternative_evidence(
+            previous_result=previous_result,
+            current=current,
+            feedback=feedback,
+            filters=filters,
+            primary_evidence=evidence,
         )
 
         decision = self._reason_about_addition(
@@ -166,6 +179,7 @@ class FeedbackAgent:
             feedback=feedback,
             operation=operation,
             evidence=evidence,
+            alternatives=alternatives,
             requested_count=requested_count,
         )
 
@@ -174,7 +188,50 @@ class FeedbackAgent:
             evidence=evidence,
             current=current,
             maximum=requested_count,
+            allow_pending=True,
         )
+        planned_decision = str(decision.get("decision") or "").strip().casefold()
+        requires_confirmation = bool(decision.get("requires_confirmation"))
+
+        # Risky or discouraged requests are never silently rejected and never
+        # immediately written to Excel. The grounded option and alternatives are
+        # stored so the student's next reply can resolve the decision.
+        if selected and (
+            requires_confirmation
+            or planned_decision in {"approve_with_warning", "suggest_alternative"}
+        ):
+            pending_action = self._create_pending_action(
+                feedback=feedback,
+                operation=operation,
+                decision=decision,
+                selected=selected,
+                alternatives=alternatives,
+                requested_count=requested_count,
+            )
+            response = self._pending_counselling_response(
+                decision=decision,
+                requested=selected,
+                alternatives=alternatives,
+            )
+            return {
+                "recommendations": current,
+                "changed": False,
+                "pending_action": pending_action,
+                "notes": [
+                    "The requested option was grounded and analysed, but no row was added because student confirmation is required."
+                ],
+                "response": response,
+                "audit": {
+                    "action": "add",
+                    "status": "awaiting_confirmation",
+                    "requested_count": requested_count,
+                    "selected_candidate_ids": decision.get("selected_candidate_ids", []),
+                    "same_college_alternative_count": len(alternatives.get("same_college", [])),
+                    "same_branch_alternative_count": len(alternatives.get("same_branch", [])),
+                    "agent_decision": planned_decision,
+                    "requires_confirmation": True,
+                },
+            }
 
         before = len(current)
         updated_current, added = self.preferences.add_exact(
@@ -183,14 +240,12 @@ class FeedbackAgent:
             requested_count,
         )
 
-        planned_decision = str(decision.get("decision") or "").strip().casefold()
-
         if added:
             current = updated_current
             effective_decision = (
                 planned_decision
                 if planned_decision in {"approve", "approve_with_warning"}
-                else "approve_with_warning"
+                else "approve"
             )
             explanation = self._successful_addition_explanation(
                 feedback=feedback,
@@ -209,6 +264,7 @@ class FeedbackAgent:
         return {
             "recommendations": current,
             "changed": bool(added),
+            "pending_action": None,
             "notes": [
                 f"Agent selected {len(selected)} grounded option(s); "
                 f"{len(added)} unique option(s) were actually added."
@@ -238,6 +294,435 @@ class FeedbackAgent:
                 ],
             },
         }
+
+    def _collect_alternative_evidence(
+        self,
+        previous_result: dict[str, Any],
+        current: list[dict[str, Any]],
+        feedback: str,
+        filters: dict[str, Any],
+        primary_evidence: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        candidates = primary_evidence.get("candidates", [])
+        candidates = [item for item in candidates if isinstance(item, dict)]
+        first = candidates[0] if candidates else {}
+
+        requested_college = str(filters.get("college") or first.get("college") or "").strip()
+        requested_branch = str(filters.get("branch") or first.get("branch") or "").strip()
+        output: dict[str, list[dict[str, Any]]] = {
+            "same_college": [],
+            "same_branch": [],
+        }
+
+        if requested_college:
+            same_college_evidence = self.counsellor.collect_feedback_evidence(
+                student_profile=dict(previous_result.get("student_profile", {})),
+                filters={"college": requested_college},
+                user_request=(
+                    f"Find grounded alternative branches in {requested_college} for: {feedback}"
+                ),
+                existing_recommendations=current,
+                evidence_limit=50,
+            )
+            rows = same_college_evidence.get("candidates", [])
+            output["same_college"] = self._prepare_alternative_candidates(
+                rows=rows if isinstance(rows, list) else [],
+                prefix="same-college",
+                exclude_college="",
+                exclude_branch=requested_branch,
+                limit=10,
+            )
+
+        if requested_branch:
+            same_branch_evidence = self.counsellor.collect_feedback_evidence(
+                student_profile=dict(previous_result.get("student_profile", {})),
+                filters={"branch": requested_branch},
+                user_request=(
+                    f"Find colleges with {requested_branch} aligned with the student's percentile for: {feedback}"
+                ),
+                existing_recommendations=current,
+                evidence_limit=80,
+            )
+            rows = same_branch_evidence.get("candidates", [])
+            output["same_branch"] = self._prepare_alternative_candidates(
+                rows=rows if isinstance(rows, list) else [],
+                prefix="same-branch",
+                exclude_college=requested_college,
+                exclude_branch="",
+                limit=12,
+            )
+
+        return output
+
+    def _prepare_alternative_candidates(
+        self,
+        rows: list[Any],
+        prefix: str,
+        exclude_college: str,
+        exclude_branch: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str]] = set()
+        prepared: list[dict[str, Any]] = []
+        for raw in rows:
+            if not isinstance(raw, dict) or raw.get("already_present"):
+                continue
+            college = str(raw.get("college") or "").strip()
+            branch = str(raw.get("branch") or "").strip()
+            if exclude_college and college.casefold() == exclude_college.casefold():
+                continue
+            if exclude_branch and branch.casefold() == exclude_branch.casefold():
+                continue
+            key = (
+                college.casefold(),
+                branch.casefold(),
+                str(raw.get("seat_type") or "").casefold(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            item = dict(raw)
+            original_id = str(item.get("candidate_id") or len(prepared) + 1)
+            item["candidate_id"] = f"{prefix}::{original_id}"
+            prepared.append(item)
+
+        def fit_key(item: dict[str, Any]) -> tuple[int, float, float]:
+            try:
+                cutoff = float(item.get("historical_cutoff"))
+                percentile = float(item.get("student_percentile"))
+                gap = cutoff - percentile
+            except (TypeError, ValueError):
+                return (2, float("inf"), float("inf"))
+            # Historically attainable options first, then nearest cutoff.
+            chance_group = 0 if gap <= 0 else 1
+            return (chance_group, abs(gap), -cutoff)
+
+        prepared.sort(key=fit_key)
+        return prepared[:limit]
+
+    def _create_pending_action(
+        self,
+        feedback: str,
+        operation: dict[str, Any],
+        decision: dict[str, Any],
+        selected: list[dict[str, Any]],
+        alternatives: dict[str, list[dict[str, Any]]],
+        requested_count: int,
+    ) -> dict[str, Any]:
+        same_college_ids = set(
+            str(value) for value in decision.get("same_college_alternative_ids", [])
+            if value
+        )
+        same_branch_ids = set(
+            str(value) for value in decision.get("same_branch_alternative_ids", [])
+            if value
+        )
+        same_college = [
+            item for item in alternatives.get("same_college", [])
+            if not same_college_ids or str(item.get("candidate_id")) in same_college_ids
+        ]
+        same_branch = [
+            item for item in alternatives.get("same_branch", [])
+            if not same_branch_ids or str(item.get("candidate_id")) in same_branch_ids
+        ]
+        return {
+            "status": "awaiting_choice" if same_college or same_branch else "awaiting_confirmation",
+            "original_feedback": feedback,
+            "operation": operation,
+            "requested_count": requested_count,
+            "requested_candidates": selected,
+            "same_college_alternatives": same_college,
+            "same_branch_alternatives": same_branch,
+            "agent_decision": decision.get("decision"),
+            "confirmation_reason": decision.get("confirmation_reason"),
+            "portfolio_guidance": decision.get("portfolio_guidance"),
+            "counsellor_response": decision.get("counsellor_response"),
+        }
+
+    def _pending_counselling_response(
+        self,
+        decision: dict[str, Any],
+        requested: list[dict[str, Any]],
+        alternatives: dict[str, list[dict[str, Any]]],
+    ) -> str:
+        base = str(decision.get("counsellor_response") or "").strip()
+        parts = [base] if base else []
+        if requested:
+            parts.append("Requested option: " + self._format_candidate_list(requested, limit=3))
+        same_college = alternatives.get("same_college", [])
+        same_branch = alternatives.get("same_branch", [])
+        if same_college:
+            parts.append(
+                "Better-chance branches in the same college: "
+                + self._format_candidate_list(same_college, limit=5)
+            )
+        if same_branch:
+            parts.append(
+                "Colleges better aligned for the same branch: "
+                + self._format_candidate_list(same_branch, limit=5)
+            )
+        parts.append(
+            "Would you like me to add the requested option anyway, choose one of these alternatives, show more suitable options, or leave the list unchanged?"
+        )
+        return " ".join(part for part in parts if part).strip()
+
+    def _handle_pending_response(
+        self,
+        previous_result: dict[str, Any],
+        current: list[dict[str, Any]],
+        feedback: str,
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        interpretation = self.llm.generate_json(
+            system_prompt="""
+You are resolving a pending MHT-CET counselling decision. Interpret the student's
+latest reply only against the supplied pending requested option and alternatives.
+Never invent an option.
+
+Return exactly:
+{
+  "action": "confirm_requested" | "choose_same_college" | "choose_same_branch" | "show_more_same_college" | "show_more_same_branch" | "cancel" | "new_request" | "unclear",
+  "selected_candidate_ids": ["candidate-id"],
+  "answer": "brief response"
+}
+
+Examples of meaning, not hardcoded wording:
+- agreement to add the original risky option -> confirm_requested
+- choosing another branch in the same institute -> choose_same_college
+- choosing a better college for the same branch -> choose_same_branch
+- asking to see more branches/colleges -> corresponding show_more action
+- declining -> cancel
+- an unrelated new modification -> new_request
+- ambiguous reply -> unclear
+""",
+            user_prompt=(
+                f"PENDING DECISION:\n{json.dumps(pending, default=str)}\n\n"
+                f"STUDENT REPLY:\n{feedback}"
+            ),
+            temperature=0.0,
+            max_tokens=1200,
+        )
+        action = str(interpretation.get("action") or "unclear").strip().casefold()
+        selected_ids = interpretation.get("selected_candidate_ids", [])
+        if not isinstance(selected_ids, list):
+            selected_ids = []
+
+        pools = {
+            "confirm_requested": pending.get("requested_candidates", []),
+            "choose_same_college": pending.get("same_college_alternatives", []),
+            "choose_same_branch": pending.get("same_branch_alternatives", []),
+        }
+
+        if action in pools:
+            pool = [item for item in pools[action] if isinstance(item, dict)]
+            by_id = {str(item.get("candidate_id")): item for item in pool}
+            chosen = [by_id[str(cid)] for cid in selected_ids if str(cid) in by_id]
+            if action == "confirm_requested" and not chosen:
+                chosen = pool[: self._positive_int(pending.get("requested_count"), 1)]
+            if not chosen:
+                response = (
+                    "I understood that you want to proceed, but I could not match your reply to one of the grounded pending options. "
+                    "Please mention the college and branch, or say 'add the requested option'."
+                )
+                return self._build_result(
+                    previous_result=previous_result,
+                    current=current,
+                    feedback=feedback,
+                    plan={"intent": "resolve_pending", "interpretation": interpretation},
+                    notes=["Pending choice remained unresolved."],
+                    responses=[response],
+                    audit=[{"action": "resolve_pending", "status": "unresolved"}],
+                    changed=False,
+                    pending_action=pending,
+                )
+
+            prepared: list[dict[str, Any]] = []
+            for source in chosen:
+                record = dict(source)
+                zone, assignment_source = self._classify_candidate_zone(record)
+                if zone not in self.ALLOWED_ZONES:
+                    continue
+                record["zone"] = zone
+                record["zone_assignment_source"] = assignment_source
+                record["user_confirmed_override"] = action == "confirm_requested"
+                record["decision_code"] = (
+                    "USER_CONFIRMED_HIGH_RISK_OPTION"
+                    if action == "confirm_requested"
+                    else "USER_SELECTED_COUNSELLOR_ALTERNATIVE"
+                )
+                prepared.append(record)
+
+            updated_current, added = self.preferences.add_exact(
+                current,
+                prepared,
+                max(1, len(prepared)),
+            )
+            if added:
+                label = (
+                    "requested high-risk preference"
+                    if action == "confirm_requested"
+                    else "selected alternative"
+                )
+                response = (
+                    f"I added the {label}: {self._format_candidate_list(added, limit=10)}. "
+                    "The list has been reclassified and sorted by zone and cutoff. Historical cutoffs do not guarantee admission."
+                )
+                guidance = str(pending.get("portfolio_guidance") or "").strip()
+                if guidance:
+                    response = f"{response} {guidance}"
+                return self._build_result(
+                    previous_result=previous_result,
+                    current=updated_current,
+                    feedback=feedback,
+                    plan={"intent": "resolve_pending", "interpretation": interpretation},
+                    notes=[f"Resolved pending decision and added {len(added)} grounded option(s)."],
+                    responses=[response],
+                    audit=[{
+                        "action": "resolve_pending",
+                        "resolution": action,
+                        "added_count": len(added),
+                    }],
+                    changed=True,
+                    pending_action=None,
+                )
+
+            return self._build_result(
+                previous_result=previous_result,
+                current=current,
+                feedback=feedback,
+                plan={"intent": "resolve_pending", "interpretation": interpretation},
+                notes=["The selected pending option was already present or failed validation."],
+                responses=["The selected grounded option was not added because it is already present or could not pass final validation."],
+                audit=[{"action": "resolve_pending", "resolution": action, "added_count": 0}],
+                changed=False,
+                pending_action=None,
+            )
+
+        if action in {"show_more_same_college", "show_more_same_branch"}:
+            key = (
+                "same_college_alternatives"
+                if action == "show_more_same_college"
+                else "same_branch_alternatives"
+            )
+            options = [item for item in pending.get(key, []) if isinstance(item, dict)]
+            label = (
+                "branches in the same college"
+                if action == "show_more_same_college"
+                else "colleges for the same branch"
+            )
+            response = (
+                f"Here are the grounded {label}: {self._format_candidate_list(options, limit=12)}. "
+                "Tell me which college and branch you want to add, or ask me to add the original option anyway."
+            )
+            return self._build_result(
+                previous_result=previous_result,
+                current=current,
+                feedback=feedback,
+                plan={"intent": "resolve_pending", "interpretation": interpretation},
+                notes=["Displayed pending alternatives without changing the list."],
+                responses=[response],
+                audit=[{"action": "resolve_pending", "resolution": action}],
+                changed=False,
+                pending_action=pending,
+            )
+
+        if action == "cancel":
+            return self._build_result(
+                previous_result=previous_result,
+                current=current,
+                feedback=feedback,
+                plan={"intent": "resolve_pending", "interpretation": interpretation},
+                notes=["Student cancelled the pending addition."],
+                responses=["Understood. I did not add the requested option, and the preference list remains unchanged."],
+                audit=[{"action": "resolve_pending", "resolution": "cancel"}],
+                changed=False,
+                pending_action=None,
+            )
+
+        if action == "new_request":
+            restarted = dict(previous_result)
+            restarted.pop("pending_feedback_action", None)
+            restarted["awaiting_user_confirmation"] = False
+            return self.apply(restarted, feedback)
+
+        answer = str(interpretation.get("answer") or "").strip() or (
+            "I still need your choice. Please say whether to add the requested option anyway, choose an alternative branch, choose a better-aligned college for the same branch, or cancel."
+        )
+        return self._build_result(
+            previous_result=previous_result,
+            current=current,
+            feedback=feedback,
+            plan={"intent": "resolve_pending", "interpretation": interpretation},
+            notes=["Student reply was ambiguous; pending decision retained."],
+            responses=[answer],
+            audit=[{"action": "resolve_pending", "resolution": "unclear"}],
+            changed=False,
+            pending_action=pending,
+        )
+
+    def _build_result(
+        self,
+        previous_result: dict[str, Any],
+        current: list[dict[str, Any]],
+        feedback: str,
+        plan: dict[str, Any],
+        notes: list[str],
+        responses: list[str],
+        audit: list[dict[str, Any]],
+        changed: bool,
+        pending_action: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        final_recommendations = self._classify_and_sort_recommendations(current)
+        final_recommendations = self.preferences.resequence(final_recommendations)
+        requested_counts = previous_result.get("requested_zone_counts")
+        validation = self.preferences.validate(
+            final_recommendations,
+            requested_counts if isinstance(requested_counts, dict) else None,
+        )
+
+        updated = dict(previous_result)
+        updated["recommendations"] = final_recommendations
+        updated["feedback"] = feedback
+        updated["feedback_plan"] = plan
+        updated["feedback_notes"] = notes
+        updated["counsellor_responses"] = responses
+        updated["feedback_audit"] = audit
+        updated["list_changed"] = changed
+        updated["validation"] = validation
+        updated["zone_counts"] = validation.get(
+            "zone_counts",
+            dict(Counter(str(item.get("zone")) for item in final_recommendations)),
+        )
+        updated["generated_college_count"] = len(final_recommendations)
+        updated["pending_feedback_action"] = pending_action
+        updated["awaiting_user_confirmation"] = bool(pending_action)
+        updated["status"] = (
+            "awaiting_confirmation"
+            if pending_action
+            else ("success" if validation.get("is_valid", True) else "partial_success")
+        )
+        updated["summary"] = " ".join(responses).strip() or "Preference list reviewed."
+        return updated
+
+    @staticmethod
+    def _format_candidate_list(candidates: list[dict[str, Any]], limit: int = 5) -> str:
+        formatted: list[str] = []
+        for item in candidates[:limit]:
+            try:
+                cutoff = f"{float(item.get('historical_cutoff')):.2f}"
+            except (TypeError, ValueError):
+                cutoff = "not available"
+            try:
+                student = float(item.get("student_percentile"))
+                gap = float(item.get("historical_cutoff")) - student
+                gap_text = f", gap {gap:+.2f}"
+            except (TypeError, ValueError):
+                gap_text = ""
+            formatted.append(
+                f"{item.get('college')} - {item.get('branch')} "
+                f"(cutoff {cutoff}{gap_text}, ID {item.get('candidate_id')})"
+            )
+        return "; ".join(formatted) if formatted else "no grounded alternatives were found"
 
     def _execute_agentic_replacement(
         self,
@@ -275,6 +760,7 @@ class FeedbackAgent:
             feedback=feedback,
             operation={**operation, "action": "replace"},
             evidence=evidence,
+            alternatives={"same_college": [], "same_branch": []},
             requested_count=requested_count,
         )
         selected = self._materialise_agent_selection(
@@ -521,70 +1007,86 @@ Return exactly:
         feedback: str,
         operation: dict[str, Any],
         evidence: dict[str, Any],
+        alternatives: dict[str, list[dict[str, Any]]],
         requested_count: int,
     ) -> dict[str, Any]:
         return self.llm.generate_json(
             system_prompt="""
 You are the decision-making counsellor for an MHT-CET CAP preference list.
-Choose only from the supplied candidate IDs. You may not invent a college,
-branch, seat type, cutoff, source, or candidate ID.
+Choose only from supplied candidate IDs. Never invent a college, branch, seat,
+cutoff, source, or candidate ID.
 
-Your task is to decide whether and how the requested grounded options should be
-added. An option outside the configured percentile window is not automatically
-rejected. When the student explicitly requests a high-cutoff college, you may
-select it as an aspirational preference if grounded evidence exists and the seat
-is eligible. Explain the cutoff difference, admission risk, and why it should not
-replace realistic alternatives. Never promise admission.
+First analyse the exact college/branch requested by the student. If it is poorly
+aligned with the student's percentile, do not simply reject it and do not claim
+that it was added. Explain the historical cutoff gap and admission risk, then:
+- ask whether the student still wants the requested option added as a high-risk preference;
+- identify better branches in the same college when grounded alternatives exist;
+- identify better colleges for the same branch when grounded alternatives exist;
+- offer to suggest options that align more closely with the student's percentile.
 
-Evaluate:
-- explicit student intent
-- historical cutoff versus student percentile
-- seat/category eligibility already established in evidence
-- duplicate status
-- branch/location preferences
-- current Dream/Target/Safe balance
-- requested number of additions
+The student owns the final preference list. Your professional recommendation may
+be negative, but a grounded and eligible requested option can be added after the
+student explicitly confirms it.
+
+Set requires_confirmation=true whenever you advise against the requested option,
+consider it high/very-high risk, or prefer alternatives. For an ordinary well-
+aligned addition, requires_confirmation may be false and decision may be approve.
+Do not use college-specific rules or fixed college names.
 
 Return exactly:
 {
   "decision": "approve" | "approve_with_warning" | "reject" | "suggest_alternative",
+  "requires_confirmation": true,
   "selected_candidate_ids": ["candidate-1"],
+  "same_college_alternative_ids": ["same-college::candidate-2"],
+  "same_branch_alternative_ids": ["same-branch::candidate-3"],
   "candidate_annotations": [
     {
       "candidate_id": "candidate-1",
       "assigned_zone": "Dream|Target|Safe",
       "risk_level": "Low|Moderate|High|Very High",
-      "reasoning": "evidence-based reason shown in the final list"
+      "reasoning": "evidence-based explanation"
     }
   ],
-  "portfolio_guidance": "how to keep the overall list balanced",
-  "counsellor_response": "detailed response to the student"
+  "confirmation_reason": "why student confirmation is needed",
+  "portfolio_guidance": "how to preserve realistic choices",
+  "counsellor_response": "clear, detailed response that asks what the student wants to do next"
 }
 
 Rules:
-- Select no more than the requested count.
+- Select no more than requested_count exact requested candidates.
 - Never select candidates marked already_present=true.
-- If no grounded candidate exists, select none and explain why.
-- A configured_zone is advisory evidence, not a forced decision.
-- Every selected candidate ID must have exactly one candidate_annotations entry.
-- Every selected annotation should contain a proposed assigned_zone:
-  Dream, Target, or Safe, together with risk reasoning.
-- The proposed zone is advisory. Python will calculate the final zone from the
-  historical cutoff, student percentile, and configured cutoff windows.
-- Never infer a decision from a college name and never use a college-specific rule.
-- Do not claim that a row was added or replaced. Python reports whether the
-  deterministic mutation actually succeeded.
+- If an exact grounded candidate exists but is unrealistic, include its ID in
+  selected_candidate_ids and require confirmation rather than silently discarding it.
+- Alternative IDs must come only from the supplied alternative arrays.
+- Rank alternatives by closeness to the student's percentile and practical chance,
+  while respecting the student's category/seat evidence.
+- Do not promise admission.
+- Python performs the mutation and final zone calculation.
 """,
-            user_prompt=(
-                f"STUDENT FEEDBACK:\n{feedback}\n\n"
-                f"REQUESTED COUNT: {requested_count}\n"
-                f"PLANNED OPERATION:\n{json.dumps(operation, default=str)}\n\n"
-                f"STUDENT PROFILE:\n{json.dumps(previous_result.get('student_profile', {}), default=str)}\n\n"
-                f"CURRENT PORTFOLIO:\n{json.dumps(current, default=str)}\n\n"
-                f"NEUTRAL GROUNDED EVIDENCE:\n{json.dumps(evidence, default=str)}"
-            ),
+            user_prompt=f"""STUDENT FEEDBACK:
+{feedback}
+
+REQUESTED COUNT: {requested_count}
+PLANNED OPERATION:
+{json.dumps(operation, default=str)}
+
+STUDENT PROFILE:
+{json.dumps(previous_result.get('student_profile', {}), default=str)}
+
+CURRENT PORTFOLIO:
+{json.dumps(current, default=str)}
+
+EXACT REQUEST EVIDENCE:
+{json.dumps(evidence, default=str)}
+
+SAME COLLEGE / DIFFERENT BRANCH OPTIONS:
+{json.dumps(alternatives.get('same_college', []), default=str)}
+
+SAME BRANCH / BETTER COLLEGE OPTIONS:
+{json.dumps(alternatives.get('same_branch', []), default=str)}""",
             temperature=0.1,
-            max_tokens=2600,
+            max_tokens=3200,
         )
 
     def _materialise_agent_selection(
@@ -593,9 +1095,13 @@ Rules:
         evidence: dict[str, Any],
         current: list[dict[str, Any]],
         maximum: int,
+        allow_pending: bool = False,
     ) -> list[dict[str, Any]]:
         decision_name = str(decision.get("decision") or "").strip().casefold()
-        if decision_name not in {"approve", "approve_with_warning"}:
+        allowed = {"approve", "approve_with_warning"}
+        if allow_pending:
+            allowed.update({"suggest_alternative", "reject"})
+        if decision_name not in allowed:
             return []
 
         candidates = evidence.get("candidates", [])
