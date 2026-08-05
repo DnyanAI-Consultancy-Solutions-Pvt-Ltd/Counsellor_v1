@@ -1,58 +1,103 @@
-# RAG Counsellor V2 Complete
+---
+title: MHT-CET Agentic RAG Counsellor
+emoji: 🎓
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+---
 
-This package includes the previously missing `rag/embeddings.py` and a complete runnable backend/UI.
+# 🎓 MHT-CET Agentic RAG Counsellor V3
 
-## Architecture
+An Agentic Retrieval-Augmented Generation (RAG) application for MHT-CET Engineering CAP counselling.
 
-- CAP-aware layout loader and structured cutoff chunker
-- Sentence Transformer embeddings
-- Persistent ChromaDB
-- LLM-created retrieval plan
-- Counsellor Agent
-- Feedback Agent
-- Excel export and session storage
-- FastAPI backend
-- Streamlit UI
+## Features
 
-Python does not contain fixed college names, branch priorities, or fixed Dream/Target/Safe percentile bands. The parser only interprets the official document structure. The LLM makes counselling decisions from retrieved evidence.
+- Multi-Agent Architecture
+- AI Counsellor Agent
+- AI Feedback Agent
+- ChromaDB Vector Database
+- LangGraph Workflow
+- Streamlit Frontend
+- FastAPI Backend
+- Groq LLM
+- Excel Recommendation Generation
+- Interactive Feedback Chat
+- Dynamic College Addition & Removal
+- Dream / Target / Safe Classification
+- Branch-wise Recommendation
+- College-wise Recommendation
+- Semantic Search over CAP PDFs
 
-## Windows setup
+---
 
-```powershell
-cd C:\RAG_Counsellor_V2_Complete
-python -m venv venv
-venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-copy .env.example .env
-notepad .env
-```
+## Technology Stack
 
-Add your Groq API key to `.env`.
+- Python 3.11
+- Streamlit
+- FastAPI
+- LangGraph
+- ChromaDB
+- Sentence Transformers
+- Groq API
+- Pandas
+- OpenPyXL
+- PyMuPDF
 
-## Start backend
+---
 
-```powershell
-uvicorn api:app --reload
-```
+## Project Workflow
 
-Open `http://127.0.0.1:8000/docs`.
+1. Upload CAP Cutoff PDFs
+2. Parse PDF Documents
+3. Create Chunks
+4. Generate Embeddings
+5. Store in ChromaDB
+6. Student enters profile
+7. Counsellor Agent generates recommendations
+8. Feedback Agent refines recommendations
+9. Excel report generated
 
-## Start UI
+---
 
-In a second terminal:
+## Agent Workflow
 
-```powershell
-cd C:\RAG_Counsellor_V2_Complete
-venv\Scripts\activate
-streamlit run app.py
-```
+### Counsellor Agent
 
-## First run
+- Retrieves cutoff information from ChromaDB
+- Filters by
+  - Percentile
+  - Category
+  - Gender
+  - Preferred Branch
+  - Preferred Location
+- Classifies colleges into
+  - Dream
+  - Target
+  - Safe
+- Generates ranked recommendations
 
-1. Use `DELETE /knowledge-base` to clear old vectors.
-2. Upload the CAP cutoff PDF with `document_type=cutoff`.
-3. Confirm `structured_cutoff_records` is greater than zero.
-4. Call `/counsel` or use the Streamlit UI.
+### Feedback Agent
 
-The first embedding run downloads the configured Sentence Transformer model and can take several minutes.
+- Understands natural language requests
+- Adds colleges
+- Removes colleges
+- Suggests better branches
+- Suggests better colleges
+- Explains cutoff differences
+- Requests confirmation before forcing high-cutoff colleges
+- Updates recommendation list without regenerating the entire counselling result
+
+---
+
+## Deployment
+
+This project is deployed as a Docker Space on Hugging Face.
+
+---
+
+## Author
+
+Developed by DnyanAI
