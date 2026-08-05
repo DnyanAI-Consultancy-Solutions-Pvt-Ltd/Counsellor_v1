@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import requests
 import streamlit as st
+
 
 # ==========================================================
 # Configuration
@@ -55,30 +57,10 @@ LOCATION_OPTIONS = [
     "Solapur", "Ahmednagar",
 ]
 
-COLLEGE_PREFERENCE_OPTIONS = [
-    "No Preference",
-    "Top Colleges Only",
-    "Government Colleges",
-    "Government + Autonomous",
-    "Private Colleges",
-    "Minority Colleges",
-]
-
 GENDER_OPTIONS = [
     "Not Specified", "Male", "Female", "Other", "Prefer Not To Say"
 ]
 
-HOME_UNIVERSITY_OPTIONS = [
-    "No Preference",
-    "Savitribai Phule Pune University",
-    "University of Mumbai",
-    "Shivaji University",
-    "Dr. Babasaheb Ambedkar Marathwada University",
-    "Rashtrasant Tukadoji Maharaj Nagpur University",
-    "Kavayitri Bahinabai Chaudhari North Maharashtra University",
-    "Sant Gadge Baba Amravati University",
-    "SNDT Women's University",
-]
 
 COLLEGE_COUNT_OPTIONS = [10, 20, 30, 40, 50]
 
@@ -805,24 +787,21 @@ with left_column:
                 help="Select Any to remove the branch restriction.",
                 key="branches",
             )
-            locations = st.multiselect(
-                "Preferred locations",
-                LOCATION_OPTIONS,
-                default=[],
-                help="Leave empty or select Any when location is not a restriction.",
-                key="locations",
+            location_text = st.text_input(
+                "Preferred location(s)",
+                placeholder="Example: Pune, Mumbai, Nagpur",
+                help="Enter one or more cities separated by commas. Leave blank for all locations.",
+                key="location_text",
             )
-            home_university = st.selectbox(
-                "Home university",
-                HOME_UNIVERSITY_OPTIONS,
-                key="home_university",
-            )
+
+            locations = [
+                city.strip()
+                for city in location_text.split(",")
+                if city.strip()
+            ]
+            
             seat_type = st.selectbox("Seat type", SEAT_TYPE_OPTIONS, key="seat_type")
-            college_preference = st.selectbox(
-                "College preference",
-                COLLEGE_PREFERENCE_OPTIONS,
-                key="college_preference",
-            )
+        
             college_count = st.selectbox(
                 "College count",
                 COLLEGE_COUNT_OPTIONS,
@@ -856,9 +835,7 @@ with left_column:
         gender = str(st.session_state.get("gender", "Not Specified"))
         branches = list(st.session_state.get("branches", ["Computer Engineering", "Information Technology"]))
         locations = list(st.session_state.get("locations", []))
-        home_university = str(st.session_state.get("home_university", "No Preference"))
         seat_type = str(st.session_state.get("seat_type", "Any"))
-        college_preference = str(st.session_state.get("college_preference", "No Preference"))
         college_count = int(st.session_state.get("college_count", 30))
         user_request = str(st.session_state.get("user_request", "Generate a balanced ranked preference list."))
         generate_clicked = False
@@ -987,12 +964,8 @@ if generate_clicked:
             "category": category,
             "gender": None if gender == "Not Specified" else gender,
             "preferred_branches": _without_any(branches),
-            "preferred_locations": _without_any(locations),
-            "home_university": None if home_university == "No Preference" else home_university,
+            "preferred_locations": locations,
             "seat_type": None if seat_type == "Any" else seat_type,
-            "college_preference": (
-                None if college_preference == "No Preference" else college_preference
-            ),
             "college_count": college_count,
         },
         "user_request": user_request,
