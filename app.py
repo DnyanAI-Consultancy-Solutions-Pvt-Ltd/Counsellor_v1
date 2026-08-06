@@ -62,9 +62,6 @@ GENDER_OPTIONS = [
 
 COLLEGE_COUNT_OPTIONS = [10, 20, 30, 40, 50]
 
-COLLEGE_PREFERENCE_OPTIONS = [
-    "Any", "Government", "Government Aided", "Autonomous", "Private", "Minority"
-]
 
 # ==========================================================
 # Helpers
@@ -802,11 +799,7 @@ with left_column:
             ]
             
             seat_type = st.selectbox("Seat type", SEAT_TYPE_OPTIONS, key="seat_type")
-            college_preference = st.selectbox(
-                "College preference",
-                COLLEGE_PREFERENCE_OPTIONS,
-                key="college_preference",
-            )
+        
             college_count = st.selectbox(
                 "College count",
                 COLLEGE_COUNT_OPTIONS,
