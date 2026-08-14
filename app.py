@@ -65,8 +65,6 @@ GENDER_OPTIONS = [
 
 COLLEGE_COUNT_OPTIONS = [10, 20, 30, 40, 50]
 
-<<<<<<< HEAD
-
 UNIVERSITY_MAPPING_PATH = Path(__file__).parent / "data" / "university_college_mapping.xlsx"
 
 
@@ -105,10 +103,6 @@ def _load_university_options() -> list[str]:
 
 
 UNIVERSITY_OPTIONS = _load_university_options()
-
-
-=======
->>>>>>> 72dd164bd9ab1c48dc6ea4cfc6cea7619d84cb99
 
 # ==========================================================
 # Helpers
@@ -845,7 +839,7 @@ with left_column:
                 if city.strip()
             ]
             
-<<<<<<< HEAD
+
             preferred_university = st.selectbox(
                 "Preferred University",
                 UNIVERSITY_OPTIONS,
@@ -857,8 +851,6 @@ with left_column:
                 ),
             )
 
-=======
->>>>>>> 72dd164bd9ab1c48dc6ea4cfc6cea7619d84cb99
             seat_type = st.selectbox("Seat type", SEAT_TYPE_OPTIONS, key="seat_type")
         
             college_count = st.selectbox(
