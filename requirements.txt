@@ -11,5 +11,6 @@ pypdf==5.5.0
 python-docx==1.1.2
 pandas==2.2.3
 openpyxl==3.1.5
+rapidfuzz==3.14.1
 streamlit==1.45.1
 requests==2.32.3

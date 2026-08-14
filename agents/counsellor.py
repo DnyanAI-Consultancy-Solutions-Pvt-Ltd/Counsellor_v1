@@ -9,6 +9,7 @@ from config.settings import get_settings
 from rag.retriever import Retriever
 from services.llm_service import LLMService, get_llm_service
 from services.preference_service import PreferenceService
+from services.university_mapping import UniversityMappingService
 from tools.eligibility_tool import apply_profile_filters, seat_is_eligible
 
 
@@ -24,14 +25,60 @@ class CounsellorAgent:
         self.retriever = retriever or Retriever()
         self.llm = llm_service or get_llm_service()
         self.preferences = PreferenceService()
+        self.university_mapping = UniversityMappingService()
 
     def counsel(
         self,
         student_profile: dict[str, Any],
         user_request: str | None = None,
     ) -> dict[str, Any]:
+        student_profile = dict(student_profile or {})
         percentile = self._validate_profile(student_profile)
         plan = self._create_retrieval_plan(student_profile, user_request)
+
+        preferred_university = str(
+            student_profile.get("preferred_university") or ""
+        ).strip()
+        university_resolution = self.university_mapping.resolve(
+            preferred_university
+        )
+
+        if preferred_university:
+            print(f"Requested university       : {preferred_university}")
+            print(
+                "Matched university         : "
+                f"{university_resolution.get('matched_university')}"
+            )
+            print(
+                "Mapped university colleges : "
+                f"{len(university_resolution.get('colleges') or [])}"
+            )
+
+            if university_resolution.get("status") != "resolved":
+                requested_total = self._requested_college_count(student_profile)
+                return {
+                    "status": "partial_success",
+                    "summary": (
+                        f"The selected university '{preferred_university}' "
+                        "could not be resolved from data/university_college_mapping.xlsx."
+                    ),
+                    "strategy": "Structured university mapping filter.",
+                    "important_notes": [
+                        "Check the university mapping file and selected university."
+                    ],
+                    "student_profile": student_profile,
+                    "retrieval_plan": plan,
+                    "university_resolution": university_resolution,
+                    "recommendations": [],
+                    "evidence_count": 0,
+                    "zone_counts": {},
+                    "requested_zone_counts": self._allocate_zone_counts(requested_total),
+                    "missing_zone_counts": self._allocate_zone_counts(requested_total),
+                    "requested_college_count": requested_total,
+                    "generated_college_count": 0,
+                    "complete_requested_count": False,
+                }
+
         base_queries = self._normalise_queries(plan.get("search_queries", []))
         if not base_queries:
             base_queries = self._fallback_queries(student_profile, user_request)
@@ -43,22 +90,124 @@ class CounsellorAgent:
             queries=base_queries,
             top_k_per_query=max(self.settings.results_per_query, 30),
             final_limit=max(self.settings.retrieval_limit, requested_total * 4),
+            preferred_university=(
+                university_resolution.get("matched_university")
+                if preferred_university
+                else None
+            ),
         )
-        branch_filtered = self._filter_branch_results(raw_results, student_profile)
+
+        university_filtered = raw_results
+        university_filter_report = {
+            "filter_stage": "chromadb_metadata",
+            "requested_university": preferred_university or None,
+            "matched_university": university_resolution.get("matched_university"),
+            "rows_returned_by_chroma": len(raw_results),
+            "note": (
+                "University was applied directly as ChromaDB metadata during "
+                "cutoff retrieval; no second workbook post-filter was required."
+            ),
+        }
+
+        branch_filtered = self._filter_branch_results(
+            university_filtered,
+            student_profile,
+        )
         category_filtered = self.retriever.filter_cutoff_candidates(
             branch_filtered,
             category=str(student_profile.get("category", "OPEN")),
             preferred_branches=[],  # branch filtering already performed with diagnostics
         )
+        profile_for_filters = dict(student_profile)
+        profile_for_filters.pop("preferred_university", None)
+
         profile_filtered, filter_report = apply_profile_filters(
             category_filtered,
-            student_profile,
+            profile_for_filters,
         )
+        # PASS 1: use the configured Dream / Target / Safe windows.
         candidates = self._build_deterministic_candidates(
             profile_filtered,
             student_profile=student_profile,
             student_percentile=percentile,
         )
+
+        standard_candidate_count = len(candidates)
+        expanded_candidate_count = 0
+
+        # PASS 2: if strict windows cannot fill the requested portfolio,
+        # add the closest remaining grounded/seat-eligible choices from the
+        # SAME university, branch and category pool.
+        if len(candidates) < requested_total:
+            expanded_pool = self._build_deterministic_candidates(
+                profile_filtered,
+                student_profile=student_profile,
+                student_percentile=percentile,
+                include_outside_window=True,
+            )
+
+            existing_keys = {
+                self.preferences.key(item)
+                for item in candidates
+            }
+
+            fallback_items: list[dict[str, Any]] = []
+
+            for item in expanded_pool:
+                key = self.preferences.key(item)
+
+                if key in existing_keys:
+                    continue
+
+                if item.get("zone") is not None:
+                    continue
+
+                fallback = dict(item)
+                cutoff = float(
+                    fallback.get("historical_cutoff", 0.0)
+                )
+
+                # Preserve the existing 3-zone UI. A fallback below the
+                # student's percentile is Safe; above is Dream.
+                fallback["zone"] = (
+                    "Dream"
+                    if cutoff > percentile
+                    else "Safe"
+                )
+                fallback["within_recommendation_window"] = False
+                fallback["decision_code"] = (
+                    "ELIGIBLE_OUTSIDE_STANDARD_WINDOW"
+                )
+                fallback["reason"] = (
+                    "Portfolio-completion option: this is a grounded, "
+                    "seat-eligible CAP choice from the selected university "
+                    "and active branch/category filters, but its historical "
+                    "cutoff is outside the standard configured percentile "
+                    "window. It was added only because the strict-window "
+                    "pool could not fill the requested portfolio size."
+                )
+
+                fallback_items.append(fallback)
+                existing_keys.add(key)
+
+            fallback_items.sort(
+                key=self._candidate_priority
+            )
+
+            needed = max(
+                0,
+                requested_total - len(candidates),
+            )
+
+            candidates.extend(
+                fallback_items[:needed]
+            )
+
+            expanded_candidate_count = min(
+                needed,
+                len(fallback_items),
+            )
+
         recommendations = self._select_balanced_candidates(
             candidates,
             requested=requested,
@@ -76,9 +225,18 @@ class CounsellorAgent:
             "rows_matching_category": len(category_filtered),
             "rows_matching_all_active_filters": len(profile_filtered),
             "active_filter_report": filter_report,
+            "standard_window_candidates": standard_candidate_count,
+            "expanded_fallback_candidates_added": expanded_candidate_count,
             "eligible_unique_candidates": len(candidates),
             "final_selected": len(recommendations),
             "zone_candidate_counts": dict(Counter(item["zone"] for item in candidates)),
+            "requested_university": preferred_university or None,
+            "matched_university": university_resolution.get("matched_university"),
+            "mapped_university_colleges": len(
+                university_resolution.get("colleges") or []
+            ),
+            "rows_after_university_filter": len(university_filtered),
+            "university_filter_report": university_filter_report,
         }
         self._log_diagnostics(student_profile, requested_total, diagnostics)
 
@@ -93,6 +251,7 @@ class CounsellorAgent:
             "important_notes": [],
             "student_profile": student_profile,
             "retrieval_plan": plan,
+            "university_resolution": university_resolution,
             "recommendations": recommendations,
             "evidence_count": len(profile_filtered),
             "zone_counts": zone_counts,
@@ -265,10 +424,23 @@ class CounsellorAgent:
         if not queries:
             queries = self._fallback_queries(profile, user_request)
 
+        preferred_university = str(
+            profile.get("preferred_university") or ""
+        ).strip()
+        university_resolution = self.university_mapping.resolve(
+            preferred_university
+        )
+
         raw_results = self.retriever.retrieve_cutoff_pool(
             queries=queries,
             top_k_per_query=max(self.settings.results_per_query, 30),
             final_limit=max(self.settings.retrieval_limit, requested_count * 20, 100),
+            preferred_university=(
+                university_resolution.get("matched_university")
+                if preferred_university
+                and university_resolution.get("status") == "resolved"
+                else None
+            ),
         )
         branch_filtered = self._filter_branch_results(raw_results, profile)
         category_filtered = self.retriever.filter_cutoff_candidates(
@@ -404,10 +576,23 @@ class CounsellorAgent:
         if not queries:
             queries = self._fallback_queries(profile, user_request)
 
+        preferred_university = str(
+            profile.get("preferred_university") or ""
+        ).strip()
+        university_resolution = self.university_mapping.resolve(
+            preferred_university
+        )
+
         raw_results = self.retriever.retrieve_cutoff_pool(
             queries=queries,
             top_k_per_query=max(self.settings.results_per_query, 40),
             final_limit=max(self.settings.retrieval_limit, evidence_limit * 10, 150),
+            preferred_university=(
+                university_resolution.get("matched_university")
+                if preferred_university
+                and university_resolution.get("status") == "resolved"
+                else None
+            ),
         )
         branch_filtered = self._filter_branch_results(raw_results, profile)
         category_filtered = self.retriever.filter_cutoff_candidates(
@@ -607,14 +792,21 @@ class CounsellorAgent:
         print(f"Category                 : {profile.get('category')}")
         print(f"Preferred branches       : {profile.get('preferred_branches') or profile.get('preferred_branch')}")
         print(f"Requested colleges       : {requested_total}")
-        print(f"Indexed cutoff chunks    : {diagnostics.get('indexed_cutoff_chunks')}")
-        print(f"Rows matching branch     : {diagnostics.get('rows_matching_branch')}")
-        print(f"Rows matching category   : {diagnostics.get('rows_matching_category')}")
-        print(f"Rows matching all filters: {diagnostics.get('rows_matching_all_active_filters')}")
+        print(f"Requested university     : {diagnostics.get('requested_university')}")
+        print(f"Matched university       : {diagnostics.get('matched_university')}")
+        print(f"Mapped university colleges: {diagnostics.get('mapped_university_colleges')}")
+        print(f"Total CAP records        : {diagnostics.get('indexed_cutoff_chunks')}")
+        print(f"After university filter  : {diagnostics.get('rows_after_university_filter')}")
+        print(f"After branch filter      : {diagnostics.get('rows_matching_branch')}")
+        print(f"After category filter    : {diagnostics.get('rows_matching_category')}")
+        print(f"After profile filter     : {diagnostics.get('rows_matching_all_active_filters')}")
         print(f"Active filter report     : {diagnostics.get('active_filter_report')}")
-        print(f"Eligible unique choices  : {diagnostics.get('eligible_unique_candidates')}")
+        print(f"University filter report : {diagnostics.get('university_filter_report')}")
+        print(f"Standard-window candidates: {diagnostics.get('standard_window_candidates')}")
+        print(f"Fallback candidates added : {diagnostics.get('expanded_fallback_candidates_added')}")
+        print(f"Eligible candidates      : {diagnostics.get('eligible_unique_candidates')}")
         print(f"Zone candidate counts    : {diagnostics.get('zone_candidate_counts')}")
-        print(f"Final selected           : {diagnostics.get('final_selected')}")
+        print(f"Final recommendations    : {diagnostics.get('final_selected')}")
         print("=" * 64 + "\n")
 
     def _create_retrieval_plan(self, profile: dict[str, Any], user_request: str | None) -> dict[str, Any]:

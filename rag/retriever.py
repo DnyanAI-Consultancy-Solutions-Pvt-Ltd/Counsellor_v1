@@ -20,6 +20,7 @@ class Retriever:
         top_k_per_query: int | None = None,
         final_limit: int | None = None,
         document_type: str | None = None,
+        university: str | None = None,
     ) -> list[dict[str, Any]]:
         unique_queries = self._clean_queries(queries)
         combined: dict[str, dict[str, Any]] = {}
@@ -31,6 +32,7 @@ class Retriever:
                 query=query,
                 top_k=top_k_per_query or self.settings.results_per_query,
                 document_type=document_type,
+                university=university,
             )
 
             for result in results:
@@ -115,6 +117,7 @@ class Retriever:
         queries: list[str],
         top_k_per_query: int | None = None,
         final_limit: int | None = None,
+        preferred_university: str | None = None,
     ) -> list[dict[str, Any]]:
         """Combine semantic results with the complete structured cutoff pool.
 
@@ -127,8 +130,12 @@ class Retriever:
             top_k_per_query=top_k_per_query,
             final_limit=final_limit,
             document_type="cutoff",
+            university=preferred_university,
         )
-        exhaustive = self.store.list_cutoff_records(document_type="cutoff")
+        exhaustive = self.store.list_cutoff_records(
+            document_type="cutoff",
+            university=preferred_university,
+        )
 
         combined: dict[str, dict[str, Any]] = {}
         for result in semantic + exhaustive:

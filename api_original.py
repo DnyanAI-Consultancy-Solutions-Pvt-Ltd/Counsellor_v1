@@ -103,7 +103,8 @@ class StudentProfileRequest(BaseModel):
     preferred_locations: list[str] = Field(
         default_factory=list,
     )
-
+    preferred_university: str | None = None
+    
     college_preference: str | None = None
 
     home_university: str | None = None

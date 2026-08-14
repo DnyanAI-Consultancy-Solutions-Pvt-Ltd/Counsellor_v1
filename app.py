@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 import requests
 import streamlit as st
+from openpyxl import load_workbook
 
 # ==========================================================
 # Configuration
@@ -61,6 +62,47 @@ GENDER_OPTIONS = [
 
 
 COLLEGE_COUNT_OPTIONS = [10, 20, 30, 40, 50]
+
+
+UNIVERSITY_MAPPING_PATH = Path(__file__).parent / "data" / "university_college_mapping.xlsx"
+
+
+def _load_university_options() -> list[str]:
+    if not UNIVERSITY_MAPPING_PATH.exists():
+        return ["Any"]
+
+    wb = load_workbook(UNIVERSITY_MAPPING_PATH, read_only=True, data_only=True)
+    try:
+        ws = (
+            wb["University College Mapping"]
+            if "University College Mapping" in wb.sheetnames
+            else wb[wb.sheetnames[0]]
+        )
+        rows = ws.iter_rows(values_only=True)
+        headers = [str(v or "").strip() for v in (next(rows, None) or [])]
+        if "University" not in headers:
+            return ["Any"]
+
+        index = headers.index("University")
+        output = ["Any"]
+        seen: set[str] = set()
+
+        for row in rows:
+            if index >= len(row):
+                continue
+            name = str(row[index] or "").strip()
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                output.append(name)
+
+        return output
+    finally:
+        wb.close()
+
+
+UNIVERSITY_OPTIONS = _load_university_options()
+
 
 
 # ==========================================================
@@ -798,6 +840,17 @@ with left_column:
                 if city.strip()
             ]
             
+            preferred_university = st.selectbox(
+                "Preferred University",
+                UNIVERSITY_OPTIONS,
+                index=0,
+                key="preferred_university",
+                help=(
+                    "Select Any for statewide recommendations. "
+                    "A selected university is applied as a hard filter before ranking."
+                ),
+            )
+
             seat_type = st.selectbox("Seat type", SEAT_TYPE_OPTIONS, key="seat_type")
         
             college_count = st.selectbox(
@@ -832,7 +885,15 @@ with left_column:
         category = str(st.session_state.get("category", "OPEN"))
         gender = str(st.session_state.get("gender", "Not Specified"))
         branches = list(st.session_state.get("branches", ["Computer Engineering", "Information Technology"]))
-        locations = list(st.session_state.get("locations", []))
+        location_text = str(st.session_state.get("location_text", ""))
+        locations = [
+            city.strip()
+            for city in location_text.split(",")
+            if city.strip()
+        ]
+        preferred_university = str(
+            st.session_state.get("preferred_university", "Any")
+        )
         seat_type = str(st.session_state.get("seat_type", "Any"))
         college_count = int(st.session_state.get("college_count", 30))
         user_request = str(st.session_state.get("user_request", "Generate a balanced ranked preference list."))
@@ -963,6 +1024,11 @@ if generate_clicked:
             "gender": None if gender == "Not Specified" else gender,
             "preferred_branches": _without_any(branches),
             "preferred_locations": locations,
+            "preferred_university": (
+                None
+                if preferred_university == "Any"
+                else preferred_university
+            ),
             "seat_type": None if seat_type == "Any" else seat_type,
             "college_count": college_count,
         },
